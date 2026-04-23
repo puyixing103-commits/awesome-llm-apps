@@ -1,0 +1,17 @@
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\bin\Debug\DC_1004.Services.dll
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\bin\Debug\DC_1004.Services.pdb
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\bin\Debug\DataAcquisitionLibrary.dll
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\bin\Debug\DC_1004.Core.dll
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\bin\Debug\Newtonsoft.Json.dll
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\bin\Debug\MQTTnet.dll
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\bin\Debug\DC_1004.Core.pdb
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\bin\Debug\DataAcquisitionLibrary.pdb
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\bin\Debug\MQTTnet.xml
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\obj\Debug\DC_1004.Services.csproj.AssemblyReference.cache
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\obj\Debug\DC_1004.Services.csproj.CoreCompileInputs.cache
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\obj\Debug\DC_1004..2DB3AC8A.Up2Date
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\obj\Debug\DC_1004.Services.dll
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\obj\Debug\DC_1004.Services.pdb
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\bin\Debug\DC_1004.Models.dll
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\bin\Debug\DC_1004.Models.pdb
+D:\workspace\tuoli\CSharp\DC-1004\DC_1004.Services\bin\Debug\Newtonsoft.Json.xml
