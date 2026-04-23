@@ -76,12 +76,13 @@ namespace SocketA0Demo
 
         private async Task taskt() 
         {
-            while (true)
+            while (!_cts.Token.IsCancellationRequested)
             {
-                DataAcquisitionManager.EnqueueLog($"采集队列数量：{_recvQueueCount}");
-                //_recvQueueCount
-
-                    await Task.Delay(1000);
+                if (_recvQueueCount > 0)
+                {
+                    DataAcquisitionManager.EnqueueLog($"采集队列数量：{_recvQueueCount}");
+                }
+                await Task.Delay(1000, _cts.Token);
             }
             
         

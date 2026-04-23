@@ -104,7 +104,7 @@ public class DataAcquisitionManager
             }
             else
             {
-                Thread.SpinWait(20);
+                Thread.SpinWait(8);
             }
         }
     }
@@ -304,11 +304,14 @@ private string voltage = "0";
                         string[] array = new string[16];
                         bool flag = false;
                         int num = 0;
-                        Stopwatch stopwatch = Stopwatch.StartNew();
-                        StringBuilder stringBuilder = new StringBuilder(16);
                         while (true)
                         {
-                            if ((serialPortReader as SerialPortDataReader).Queue == null || !(serialPortReader as SerialPortDataReader).Queue.TryTake(out var item) || item == null || item.Payload == null)
+                            if ((serialPortReader as SerialPortDataReader).Queue == null)
+                            {
+                                await Task.Delay(2, _cts.Token);
+                                continue;
+                            }
+                            if (!(serialPortReader as SerialPortDataReader).Queue.TryTake(out var item, 2, _cts.Token) || item == null || item.Payload == null)
                             {
                                 continue;
                             }
