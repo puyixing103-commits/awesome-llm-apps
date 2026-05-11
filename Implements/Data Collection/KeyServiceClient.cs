@@ -19,12 +19,12 @@ public class KeyServiceClient : IKeyServiceClient
 
     public KeyServiceClient(KeyServiceConfig config)
     {
-        _baseUrl = config.url;
+        _baseUrl = "http://127.0.0.1:8080/api/crypto/encrypt/batch";
         _client = new HttpClient();
         _client.Timeout = TimeSpan.FromSeconds(config.timeout);
     //    ／／ _client.BaseAddress = new Uri(_baseUrl);
         _client.DefaultRequestHeaders.Authorization =
-            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.authToken);
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", "TKN1:XzdTWZmkKm7/1ka2Zdxa1A==:zy9BfghUkgkEIoelo9oeU3+4tElBesdMkWAs2/XdPKUUpeDlooOq9XRKpZjx+Tzg");
     }
 
     async Task<KeyResponse> IKeyServiceClient.GetKeyAsync(string json)

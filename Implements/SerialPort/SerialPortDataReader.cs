@@ -66,7 +66,7 @@ public class SerialPortDataReader : IDataReader, IDisposable
     }
 
     private Task SendLoopAsync(int interval)
-    {
+    {    
         _port.Write(_commandBytes, 0, _commandBytes.Length);
         if (interval <= 0)
         {

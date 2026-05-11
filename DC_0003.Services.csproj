@@ -86,11 +86,14 @@
   <ItemGroup>
     <Compile Include="CustomMQTTConfigModel.cs" />
     <Compile Include="Extensions.cs" />
+    <Compile Include="Implements\Data Collection\Dto\ResponseBuilder.cs" />
+    <Compile Include="Implements\Data Collection\Dto\DispatchCommandDto.cs" />
     <Compile Include="Implements\Data Collection\JavaServiceManager.cs" />
     <Compile Include="Implements\Data Collection\NativeApiServer.cs" />
     <Compile Include="Implements\Data Collection\PortChecker.cs" />
     <Compile Include="Implements\Data Collection\SocketClient.cs" />
     <Compile Include="Implements\Data Collection\NewMqttServices.cs" />
+    <Compile Include="Implements\Data Collection\TcpCollectorClient.cs" />
     <Compile Include="Implements\Data Collection\TcpConfigReceiver.cs" />
     <Compile Include="Implements\Data Collection\DataAcquisitionManager.cs" />
     <Compile Include="Implements\Data Collection\IUploader.cs" />
@@ -103,6 +106,7 @@
     <Compile Include="Implements\SerialPort\SerialPortDataReader.cs" />
     <Compile Include="Implements\Sockets\TCPDataReader.cs" />
     <Compile Include="Implements\Sockets\TCPDataSender.cs" />
+    <Compile Include="Implements\Data Collection\StorageUploadManager.cs" />
     <Compile Include="Interfaces\ISocketDataReader.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>

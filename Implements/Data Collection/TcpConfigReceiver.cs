@@ -1,16 +1,21 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices.ComTypes;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+
+using ApiModels;
 
 using DataAcquisitionLibrary;
 
 using DC_0003.Models;
+using DC_0003.Services.Implements.Data_Collection.Dto;
 
 using Newtonsoft.Json;
 
@@ -23,13 +28,19 @@ public class TcpConfigReceiver
     private event Action _closeCallback;
     private LogServices logServices = LogServices.Instance;
 
+    public event Action<string> StartCommade;
+
+    public event Action StopCommade;
+
     public TcpConfigReceiver(int port, string storageFile, Action<string> reloadCallback = null, Action _ctscallback = null)
     {
         _port = port;
         _storageFile = storageFile;
         _reloadCallback = reloadCallback;
         _cts = DataAcquisitionManager._cts;
-        _=InitConfigAsync();
+        LoadConfigToDictionary();
+        //_=HeartbeatServiceAsync();
+        //_=InitConfigAsync();作废
     }
     private HttpListener _listener;
     private Thread _serverThread;
@@ -54,36 +65,111 @@ public class TcpConfigReceiver
                 return; // 直接返回，不进后续逻辑
             }
 
+            //HeartbeatServiceAsync
 
-            // 仅处理 GET 请求的 /api/config
-            if (request.HttpMethod != "GET" || request.Url.AbsolutePath.ToLowerInvariant() != "/api/config")
+            if (request.HttpMethod == "GET")
             {
-                string errorResult = request.HttpMethod != "GET"
-                    ? "{\"code\":405,\"msg\":\"仅支持GET请求\"}"
-                    : "{\"code\":404,\"msg\":\"接口不存在\"}";
+                response.ContentType = "application/json";
+                string results = null;
 
-                logServices.Warning(errorResult);
+                switch (request.Url.AbsolutePath)
+                {
+                    // 返回 HeartbeatServiceAsync 的结果
+                    case "/api/datacollection/server/heartbeat":
+                        try
+                        {
+                            // ProcessRequest 为同步方法，阻塞等待异步方法结果
+                            results = JsonConvert.SerializeObject(ResponseBuilder.Success(HeartbeatServiceAsync()));
+                        }
+                        catch (Exception ex)
+                        {
+                            logServices.Error($"生成心跳信息失败: {ex}");
+                            results = "{\"code\":500,\"msg\":\"未知错误\"}";
+                        }
+                        break;
 
-                byte[] errorBuffer = Encoding.UTF8.GetBytes(errorResult);
-                response.ContentLength64 = errorBuffer.Length;
-                response.OutputStream.Write(errorBuffer, 0, errorBuffer.Length);
-                response.Close();
+                    default:
+                        results = "{\"code\":404,\"msg\":\"接口不存在\"}";
+                        break;
+                }
+
+                byte[] buffer = Encoding.UTF8.GetBytes(results ?? "{\"code\":500,\"msg\":\"未知错误\"}");
+                response.ContentLength64 = buffer.Length;
+                response.OutputStream.Write(buffer, 0, buffer.Length);
                 return;
             }
 
-            // 处理 /api/config 请求
-            string result = HandleConfigRequest();
+            if (request.HttpMethod == "POST")
+            {
+                string json = new StreamReader(request.InputStream).ReadToEnd();
+                string results = null;
 
-            byte[] buffer = Encoding.UTF8.GetBytes(result);
-            response.ContentLength64 = buffer.Length;
-            response.OutputStream.Write(buffer, 0, buffer.Length);
+                DispatchCommandDto dispatchCommandDto = JsonConvert.DeserializeObject<DispatchCommandDto>(json);
+               
+                logServices.Info($"HTPP 接收到消息: {json},请求头:{request.Url.AbsolutePath}");
+
+                switch (request.Url.AbsolutePath)
+                {
+                    case "/api/datacollection/server/dispatch-command":
+                        switch (dispatchCommandDto.runState)
+                        {
+                            case "STARTING":
+                                LoadConfigToDictionary();
+                                if (DataAcquisitionManager._isDataCollecting)
+                                {
+                                    logServices.Warning("HTTP请求但当前正在采集数据，已拒绝");
+                                    var s = ResponseBuilder.AlreadyRunning();
+
+                                    results = JsonConvert.SerializeObject(s);
+
+                                    break;
+                                }
+                                //OnLogOutput?.Invoke($"HTPP 接收到开始采集指令:{json}");
+                               
+
+                                // 处理 /api/config 请求
+                                results = HandleConfigRequest(dispatchCommandDto.configPath);
+                                
+                                break;
+                          
+                            case "STOPPED"://停止
+
+                                if (!DataAcquisitionManager._isDataCollecting)
+                                {
+                                    results = JsonConvert.SerializeObject(ResponseBuilder.AlreadyStopped()); break;
+                                }
+                                StopCommade?.Invoke();//停止命令
+                                results = JsonConvert.SerializeObject(ResponseBuilder.StopSuccess());
+                                break;
+
+                            default:
+                                results = "{\"code\":404,\"msg\":\"\"HTPP 接收到未知指令\"}";
+                                //OnLogOutput?.Invoke($"HTPP 接收到未知指令:{mqttMessage.commandCode}");
+                                break;
+                        }
+                        break;
+
+                 
+
+                    default:
+                        results = results ?? "{\"code\":404,\"msg\":\"接口不存在\"}";
+                        break;
+                }
+
+             
+
+                byte[] buffer = Encoding.UTF8.GetBytes(results);
+                response.ContentLength64 = buffer.Length;
+                response.OutputStream.Write(buffer, 0, buffer.Length);
+            }
+         
         }
         catch (Exception ex)
         {
             logServices?.Error($"处理请求异常: {ex}");
             try
             {
-                string errorJson = "{\"code\":500,\"msg\":\"请检查输入配置项是否正确!\"}";
+                string errorJson = JsonConvert.SerializeObject(ResponseBuilder.Error());
                 byte[] errorBuffer = Encoding.UTF8.GetBytes(errorJson);
                 response.ContentLength64 = errorBuffer.Length;
                 response.OutputStream.Write(errorBuffer, 0, errorBuffer.Length);
@@ -120,26 +206,19 @@ public class TcpConfigReceiver
         }
     }
     private readonly IniFileManager _iniFileManager = new IniFileManager(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config", "Config.ini"));
-    private string HandleConfigRequest()
+    private string HandleConfigRequest(string url)
     {
-        // 1. 检查采集状态
-        if (DataAcquisitionManager._isDataCollecting)
-        {
-            logServices.Warning("TCP配置接收服务收到新配置请求，但当前正在采集数据，已拒绝");
-            DataAcquisitionManager.EnqueueLog("TCP配置接收服务收到新配置请求，但当前正在采集数据，已拒绝");
-            return "{\"code\":409,\"msg\":\"当前正在采集数据，无法更新配置\"}";
-        }
 
         // 2. 写死的配置文件路径
-        
-        string configDir = _iniFileManager.GetValue("NEWDATACOLLECTION", "FILEURL");//@"C:\Users\shucai\Desktop\config";
-        string fullData = GetLatestJsonFile(configDir);
+
+        //string configDir = _iniFileManager.GetValue("NEWDATACOLLECTION", "FILEURL");//@"C:\Users\shucai\Desktop\config";
+        string fullData = url;// GetLatestJsonFile(configDir);
         // 3. 校验文件是否存在
         if (!File.Exists(fullData))
         {
             logServices.Warning($"配置文件不存在: {fullData}");
             DataAcquisitionManager.EnqueueLog($"配置文件不存在: {fullData}");
-            return $"{{\"code\":404,\"msg\":\"配置文件不存在\",\"data\":{{\"filePath\":\"{fullData}\"}}}}";
+            return $"{{\"code\":404,\"msg\":\"配置文件不存在\",\"data\":{{\"message\":\"{fullData}\"}}}}";
         }
 
         // 4. 处理配置文件
@@ -147,27 +226,19 @@ public class TcpConfigReceiver
         {
             string jsonStr = File.ReadAllText(fullData, Encoding.UTF8);
 
-            // 保存到应用目录
-            var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config", _storageFile);
-            string dir = Path.GetDirectoryName(path);
-            if (!Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
-
-            File.WriteAllText(path, jsonStr, Encoding.UTF8);
-
             // 触发热加载
             _reloadCallback?.Invoke(jsonStr);
-
-
-            DataAcquisitionManager.EnqueueLog($"TCP配置接收服务成功更新配置，路径:{fullData}");
             logServices.Info($"TCP配置接收服务成功更新配置，路径:{fullData}");
+            StartCommade?.Invoke("");
+            //DataAcquisitionManager.EnqueueLog($"TCP配置接收服务成功更新配置，路径:{fullData}");
+            logServices.Info($"数据开始采集");
 
-            return $"{{\"code\":200,\"msg\":\"配置文件更新成功\",\"data\":{{\"filePath\":\"{fullData.Replace("\\", "\\\\")}\"}}}}";
+            return JsonConvert.SerializeObject(ResponseBuilder.StartSuccess());
         }
         catch (Exception ex)
         {
             logServices?.Error($"处理配置文件失败，路径:{fullData}，错误:{ex}");
-            return "{\"code\":500,\"msg\":\"处理配置文件失败\"}";
+            return JsonConvert.SerializeObject(ResponseBuilder.Error());
         }
     }
     //private void ProcessRequest(HttpListenerContext context)
@@ -270,6 +341,73 @@ public class TcpConfigReceiver
     //    }
     //}
 
+
+    private object HeartbeatServiceAsync()
+    {
+        //int HBCOUNT = _windowsConfigModel.HBCOUNT > 0 ? _windowsConfigModel.HBCOUNT : 60;
+        // 优化点：原代码直接向共享字典 _configDict Add 元素，多次心跳会导致异常（键重复）或内存泄漏
+        // 此处每次心跳构建独立的属性字典，避免污染全局配置
+        var envProperties = new Dictionary<string, object>(_configDict)
+            {
+                { "os_name", Environment.OSVersion.ToString() },
+                { "os_version", Environment.OSVersion.Version.ToString() },
+                { "machine_name", Environment.MachineName }
+            };
+
+       
+            SystemInfoModel systemInfo = SystemInfoHelper.GetSystemInfo();
+            var heartbeatMessage = new
+            {
+                type = "data_collect",
+                content = new
+                {
+                    dataCollectProgramId = envProperties["DATA_COLLECT_PROGRAM_ID.value"].ToString(),
+                    dataCollectDeviceNo = envProperties["DATA_COLLECT_DEVICE_NO.value"].ToString(),
+                    roomCode = envProperties["ROOM_CODE.value"].ToString(),
+                    deviceCode = envProperties["DEVICE_CODE.value"].ToString(),
+                    programVersion = envProperties["PROGRAM_VERSION.value"].ToString(),
+                    dataCollectSystemRunParamDTO = systemInfo,
+                    envProperties = envProperties
+                }
+            };
+
+            var d = JsonConvert.SerializeObject(heartbeatMessage);
+
+            return heartbeatMessage;
+
+ 
+
+
+        // 优化11：使用 Task.Delay 代替 Thread.Sleep，并在取消时立即唤醒退出
+
+
+    }
+
+    private void LoadConfigToDictionary()
+    {
+        _configDict.Clear();
+        var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config", "数采配置文件.json");
+        string json = File.ReadAllText(path);
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        ParseJsonToDict(root, _configDict, "");
+    }
+    private Dictionary<string, object> _configDict = new Dictionary<string, object>();
+    void ParseJsonToDict(JsonElement element, Dictionary<string, object> dict, string parentKey)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var prop in element.EnumerateObject())
+            {
+                string key = string.IsNullOrEmpty(parentKey) ? prop.Name : $"{parentKey}.{prop.Name}";
+                ParseJsonToDict(prop.Value, dict, key);
+            }
+        }
+        else
+        {
+            dict[parentKey] = element.GetRawText().Trim('"');
+        }
+    }
     public void Stop()
     {
         _listener?.Stop();

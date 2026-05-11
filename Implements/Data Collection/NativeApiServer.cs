@@ -98,6 +98,15 @@ public class NativeApiServer
                         {
                             case "SEND_ENTITY_IDS":
                             case "COMMAND_START":
+
+                                if (DataAcquisitionManager._isDataCollecting)
+                                {
+                                    logServices.Warning("HTTP请求但当前正在采集数据，已拒绝");
+                                    
+                                    result = "{\"code\":409,\"msg\":\"当前正在采集数据中,请稍后再试\"}";
+
+                                    break;
+                                }
                                 OnLogOutput?.Invoke($"HTPP 接收到开始采集指令:{json}");
                                 OnStartCommand?.Invoke(json);
                                 result = "{\"code\":200,\"msg\":\"启动命令已执行\"}";
@@ -126,6 +135,11 @@ public class NativeApiServer
                     case "/api/upload":
                         OnLogOutput?.Invoke($"收到上传数据：{json}");
                         result = "{\"code\":200,\"msg\":\"上传成功\",\"data\":" + json + "}";
+                        break;
+
+                    case "/api/datacollection/server/dispatch-command":
+                        OnLogOutput?.Invoke($"收到上传数据：{json}");
+                        //result = "{\"code\":200,\"msg\":\"上传成功\",\"data\":" + json + "}";
                         break;
 
                     default:

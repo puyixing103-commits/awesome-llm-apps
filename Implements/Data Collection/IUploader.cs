@@ -7,18 +7,18 @@ using System.Threading.Tasks;
 
 using DataAcquisitionLibrary;
 
-using static HttpUploader;
+
 
 namespace DC_0003.Services.Implements.Data_Collection
 {
-    internal class Class2
+    public class Class2
     {
         /// <summary>
         /// 数据上传器接口
         /// </summary>
         public interface IUploader
         {
-            Task<bool> UploadAsync(DataMessage message,string topic);
+            //Task<bool> UploadAsync(DataMessage message,string topic);
 
             Task<bool> BatchUploadAsync(string message,string topic);
         }

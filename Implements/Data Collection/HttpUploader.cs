@@ -18,19 +18,8 @@ public class HttpUploader : IUploader
     private readonly string _method;
     private readonly LogServices _logServices = LogServices.Instance;
 
-    public HttpUploader(UpHttpConfig config)
-    {
-        _url = config.url;
-        _method = config.method?.ToUpper() ?? "POST";
-        _client = new HttpClient();
-        _client.Timeout = TimeSpan.FromSeconds(config.timeout);
-        if (config.headers != null)
-        {
-            foreach (var header in config.headers)
-            {
-                _client.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
-            }
-        }
+    public HttpUploader()
+    { 
     }
 
     public async Task<bool> BatchUploadAsync(string message, string topic)
@@ -49,10 +38,10 @@ public class HttpUploader : IUploader
                 }
             }
         }
-            catch (OperationCanceledException)
-            {
-                return false;
-            }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
         catch (Exception ex)
         {
             _logServices.Error($"批量上传异常：{ex.ToString()}");
@@ -80,9 +69,9 @@ public class HttpUploader : IUploader
     }
 
 
-  
 
-    
+
+
     public class TimeRange
     {
         public string start { get; set; }

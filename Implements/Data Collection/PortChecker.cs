@@ -24,7 +24,7 @@ public class PortChecker
     public Func<Task> GetReceiceAsync { get; set; }
     public Func<Task> RestartJavaServiceAsync { get; set; }
 
-    public PortChecker(int port, string host = "127.0.0.1", int checkIntervalMs = 10000)
+    public PortChecker(int port, string host = "127.0.0.1", int checkIntervalMs = 60000)
     {
         _port = port;
         _host = host;

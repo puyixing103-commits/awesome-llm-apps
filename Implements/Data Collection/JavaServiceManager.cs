@@ -7,7 +7,7 @@ using System.Threading.Tasks;
 
 using DataAcquisitionLibrary;
 
-using static HttpUploader;
+
 
 using static DC_0003.Services.Implements.Data_Collection.Class2;
 using System.IO;

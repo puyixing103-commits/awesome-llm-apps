@@ -1,4 +1,4 @@
-﻿﻿using System;
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -6,11 +6,13 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Ports;
 using System.Linq;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.Runtime.Remoting.Messaging;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Channels;
@@ -23,10 +25,14 @@ using DataAcquisitionLibrary.Utils;
 using DC_0003;
 using DC_0003.Core.Constants;
 using DC_0003.Models;
+using DC_0003.Services.Implements;
 
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 using SocketA0Demo;
+
+
 
 using static System.Net.Mime.MediaTypeNames;
 using static DC_0003.Services.Implements.Data_Collection.Class2;
@@ -40,7 +46,7 @@ public class DataAcquisitionManager
     private const int MaxLogQueueSize = 20000;
 
     public static AppConfig _config;
-    private IUploader _dataUploader;
+   // private IUploader _dataUploader;
     private TcpConfigReceiver _TcpConfigReceiver;
     private NativeApiServer _nativeApiServer;
     private IKeyServiceClient key;
@@ -77,7 +83,7 @@ public class DataAcquisitionManager
     //private readonly SemaphoreSlim _batchUploadSemaphore = new SemaphoreSlim(1, 1);
     private PortChecker portChecker = null;
     private JavaServiceManager _javaServiceManagers = new JavaServiceManager();
-    private HttpHeartbeatSender _heartbeatSender;
+
 
     [DllImport("winmm.dll")]
     private static extern uint timeBeginPeriod(uint uPeriod);
@@ -113,24 +119,26 @@ public class DataAcquisitionManager
     {
         try
         {
-            if (_cts != null)
-            {
-                _cts.Cancel();
-                _cts.Dispose();
-                _cts = null;
-            }
-            _cts = new CancellationTokenSource();
-            socketClient = new SocketClient(_cts);
+            
             _ = StartProcessTaskOutLog();
             StartFileLogFlushTask();
             _TcpConfigReceiver = new TcpConfigReceiver(7000, "数采配置文件.json", Init);
-             _=_TcpConfigReceiver.StartListenAsync();
+            _TcpConfigReceiver.StopCommade += StopDataCollection;
+            _TcpConfigReceiver.StartCommade += HandleStartCommand;
+            _ =_TcpConfigReceiver.StartListenAsync();
 
-            _nativeApiServer = new NativeApiServer(5002);
-            _nativeApiServer.OnStartCommand += HandleStartCommand;
-            _nativeApiServer.OnStopCommand += HandleStopCommand;
-            _nativeApiServer.OnLogOutput += (msg) => OutputLog(msg);
-            _nativeApiServer.Start();
+
+            portChecker = new PortChecker(8080);
+            portChecker.OnLog += (msg) => OutputLog(msg);
+            portChecker.GetReceiceAsync += GetReceiceAsync;
+            portChecker.RestartJavaServiceAsync += RestartJavaServiceAsync;
+            portChecker.Stop();
+            portChecker.Start();
+
+         
+
+
+
         }
         catch (Exception ex)
         {
@@ -155,13 +163,15 @@ public class DataAcquisitionManager
         _isDataCollecting = true;
         _ = Task.Run(async () =>
         {
-            bool connected = await socketClient.Start(_config.TCP_IP.IP, _config.TCP_IP.PORT);
+            bool connected = await socketClient.Start(_config.IP?.value, int.TryParse(_config.PORT?.value, out int port) ? port : 0);
             if (connected)
             {
                 socketClient.OnFrameParsed -= SocketClient_OnFrameParsed;
                 socketClient.OnFrameParsed += SocketClient_OnFrameParsed;
-               Execute();
+                Execute();
                 ExecuteDischarge();
+               
+                ExecuteWaveform();
             }
             else
             {
@@ -186,8 +196,10 @@ public class DataAcquisitionManager
     {
         try{
              _isDataCollecting = false;
-            //socketClient.OnFrameParsed -= SocketClient_OnFrameParsed;
             socketClient.Stop();
+            _cts.Cancel();
+            _logServices.Info("数据采集已停止");
+         
         }
          catch 
          (Exception ex) 
@@ -199,6 +211,20 @@ public class DataAcquisitionManager
 
     public void Init(string config)
     {
+        try
+        {
+            if (_cts != null)
+            {
+                _cts.Cancel();
+                _cts.Dispose();
+                _cts = null;
+            }
+        }
+        catch 
+        {
+        }
+        _cts = new CancellationTokenSource();
+        socketClient = new SocketClient(_cts);
         // 2. 配置反序列化选项（解决大小写、空值等问题）
         var options = new JsonSerializerOptions
         {
@@ -207,64 +233,50 @@ public class DataAcquisitionManager
             AllowTrailingCommas = true // 允许末尾逗号
         };
         // 3. 反序列化为对象
-        _config = JsonSerializer.Deserialize<AppConfig>(config, options);
-        serialPortReader = new SerialPortDataReader(_config.COM.SerialPort ?? "COM1", 2, _config.COM.Command, 500, _config.COM.BaundRate, Parity.None, _config.COM.DataBits, Enum.TryParse<StopBits>(_config.COM.StopBits ?? "One", out StopBits stopBits) ? stopBits : StopBits.One, 0, 48, _cts);
-        var mqtt = _config.UpMQTT;
-        // 根据配置创建数据上传器
-        if (_config.Common.HeartbeatProtocol == "HTTP")
-            _dataUploader = new HttpUploader(_config.UpHTTP);
-        else if (_config.Common.HeartbeatProtocol == "MQTT")
-        {
-            var mqttUploader = new MqttUploader(new CustomMQTTConfigModel()
-            {
-                clientId = mqtt.ClientId,
-                mqttIp = mqtt.mqttIP,
-                mqttPort = mqtt.mqttPort,
-                passWord = mqtt.Password,
-                userName = mqtt.UserName,
-                CommandTopic = mqtt.CommandTopic,
-                CommandResponseTopic = mqtt.CommandDataTopic,
-                HeartbeatEnable=_config.Common.HeartbeatEnable
-            }, _config.WinConfig, _config.HBMqtt);
-            mqttUploader.OnStartCommand += HandleStartCommand;
-            mqttUploader.OnStopCommand += HandleStopCommand;
-            mqttUploader.OnLogOutput += (msg) => OutputLog(msg);
-            _dataUploader = mqttUploader;
-        }
-        else
-            throw new NotSupportedException($"未支持的上传协议: {_config.Common.HeartbeatProtocol}");
+        _config = JsonConvert.DeserializeObject<AppConfig>(config);
 
-        //// 创建心跳发送器
-        if (_config.Common.HeartbeatProtocol == "HTTP" && _config.Common.HeartbeatEnable)
-        {
-            _heartbeatSender = new HttpHeartbeatSender(_config.HeartbeatHTTP);
-        }
-        else if (_config.Common.HeartbeatProtocol == "MQTT") { }
-        //else
-            //throw new NotSupportedException($"未支持的心跳协议: {_config.Common.HeartbeatProtocol}");
-
-        portChecker = new PortChecker(8080);
-        portChecker.OnLog += (msg) => OutputLog(msg);
-        portChecker.GetReceiceAsync += GetReceiceAsync;
-        portChecker.RestartJavaServiceAsync+= RestartJavaServiceAsync;
-        portChecker.Stop();
-        portChecker.Start();
+        var serd = JsonConvert.SerializeObject(_config);
+        serialPortReader = new SerialPortDataReader(_config.SerialPort?.value ?? "COM1", 2, _config.Command?.value, 500, int.TryParse(_config.BaundRate?.value, out int baundRate) ? baundRate : 9600, Parity.None, int.TryParse(_config.DataBits?.value, out int dataBits) ? dataBits : 8, Enum.TryParse<StopBits>(_config.StopBits?.value ?? "One", out StopBits stopBits) ? stopBits : StopBits.One, 0, 48, _cts);
 
         //是否使用密钥
-        if (_config.Common.EnableEncryption)
+        if (bool.TryParse(_config.EnableEncryption?.value, out bool enableEncryption) && enableEncryption)
         {
-            key = new KeyServiceClient(_config.KeyService);
+            key = new KeyServiceClient(new KeyServiceConfig
+            {
+                url = _config.KeyServiceUrl?.value,
+                timeout = int.TryParse(_config.KeyServiceTimeout?.value, out int keyTimeout) ? keyTimeout : 30,
+                authToken = _config.KeyServiceAuthToken?.value
+            });
         }
-
-         
-
+        else
+        {
+            storageUploadManager = new StorageUploadManager(new KeyServiceConfig
+            {
+                url = _config.KeyServiceUrl?.value,
+                timeout = int.TryParse(_config.KeyServiceTimeout?.value, out int keyTimeout2) ? keyTimeout2 : 30,
+                authToken = _config.KeyServiceAuthToken?.value
+            });
+        }
+        currentCounts = 0;
+        currentBatchs = new StringBuilder();
+        currentCount = 0;
+        currentBatch = new StringBuilder();
         _logServices.Info($"数据采集配置初始化完成，当前配置：{config}");
         
-
     }
-  private static SerialPortDataReader serialPortReader = null;
+
+    StringBuilder currentBatchs = null;
+    int currentCounts = 0;
+    const int BATCH_SIZEs = 500;//1000;
+
+    // 全局变量
+    StringBuilder currentBatch = null;
+    int currentCount = 0;
+    const int BATCH_SIZE = 500;//;
+    private StorageUploadManager storageUploadManager = null;
+    private static SerialPortDataReader serialPortReader = null;
  
-private string voltage = "0";
+    private string voltage = "0";
     private readonly object lockObject = new object();
 
     public void SetVoltage(string newVoltage)
@@ -310,7 +322,9 @@ private string voltage = "0";
                         {
                             if ((serialPortReader as SerialPortDataReader).Queue == null || !(serialPortReader as SerialPortDataReader).Queue.TryTake(out var item) || item == null || item.Payload == null)
                             {
+                                await Task.Delay(10);
                                 continue;
+
                             }
                             string text = StringUtil.ByteArrayToHexString(item.Payload);
                             if (flag)
@@ -395,13 +409,13 @@ private string voltage = "0";
         {
             // 循环发送 "C" 指令到串口，等价 Java 代码的 RxtxUtil
             
-            while (!_cts.Token.IsCancellationRequested)
+            while (true)
             {
                 try
                 {
                     if (_dataQueueStr.IsEmpty)
                     {
-                        await Task.Delay(100, _cts.Token);
+                        await Task.Delay(100);
                         continue;
                     }
                     if (_dataQueueStr.TryDequeue(out string result))
@@ -431,9 +445,9 @@ private string voltage = "0";
                     _logServices.Error(ex.TargetSite.ToString() + "\r\n" + ex.ToString());
                 }
 
-                await Task.Delay(100, _cts.Token);
+                await Task.Delay(100);
             }
-        }, _cts.Token);
+        });
     }
 
     private async Task ProcessDataFrameAsync(DataFrame obj)
@@ -444,7 +458,7 @@ private string voltage = "0";
             var plaitResult = Reader_OnDataRead(obj);
 
             // 2. 调试模式直接写日志，不进入上传队列
-            if (_config.Common.DebugMode)
+            if (bool.TryParse(_config.DebugMode?.value, out bool debugMode) && debugMode)
             {
                 await DataWriteLogAsync(JsonConvert.SerializeObject(plaitResult));
                 return;
@@ -456,41 +470,37 @@ private string voltage = "0";
                 plain = JsonConvert.SerializeObject(plaitResult)
             };
 
-            // 4. 加密（如果需要）
-            if (_config.Common.EnableEncryption)
+            AddJsonItems(msg.plain);
+            if (currentCounts == BATCH_SIZEs)
             {
-                AddJsonItems(msg.plain);
-                if (currentCounts == BATCH_SIZEs)
+                currentBatchs.Append("]");// 结束数组
+                string jsonArray = currentBatchs.ToString();
+                // 4. 加密（如果需要）
+                if (bool.TryParse(_config.EnableEncryption?.value, out bool enableEncryption2) && enableEncryption2)
                 {
-                    currentBatchs.Append("]");// 结束数组
-                    string jsonArray = currentBatchs.ToString();
-                    string requestJson = $@"{{ ""timestamp"": {plaitResult.timestamp}, ""deviceMac"": ""{macAddress}"",""deviceCode"": ""{_config.WinConfig.DATA_COLLECT_DEVICE_NO}"",""items"": {jsonArray}}}";
+                    
+                    
+                    string requestJson = $@"{{ ""timestamp"": {plaitResult.timestamp}, ""deviceMac"": ""{macAddress}"",""deviceCode"": ""{_config.DEVICE_CODE?.value}"",""dataCollectDeivceNO"":""{_config.DATA_COLLECT_DEVICE_NO?.value}"",""items"": {jsonArray}}}";
                     var keyResult = await GetKey(requestJson);
-                 
+
                     if (keyResult == null)
                     {
                         _recvQueueStr.Writer.TryWrite(msg.plain);
 
                         return;
                     }
-                    //msg.key = keyResult.key;
-                    //msg.cipher = keyResult.cipher;
-                    //msg.time_range = keyResult.time_range.ToArray();
-                    //msg.isencrypted = true;
-                    //msg.sign = keyResult.sign;
-                    //msg.time_Id = keyResult.time_Id;
-                    //msg.ivBase64 = keyResult.ivBase64;
-                    // 6. 尝试批量上传（非阻塞，可能会在后台执行）
-                    var result = new 
-                    {
-                        deviceMac = macAddress,
-                        deviceCode= _config.WinConfig.DATA_COLLECT_DEVICE_NO,
-                        dateCollectDeivceNO = _config.WinConfig.DEVICE_CODE,
-                        items = keyResult.items.ToList()
-
-                    };
-                    await SenBatchdData(JsonConvert.SerializeObject(result), _config.UpMQTT.IOTDataTopic);
                 }
+                else
+                {
+                    
+                    string requestJson = $@"{{ ""timestamp"": {plaitResult.timestamp}, ""deviceMac"": ""{macAddress}"",""deviceCode"": ""{_config.DEVICE_CODE?.value}"",""dataCollectDeivceNO"":""{_config.DATA_COLLECT_DEVICE_NO?.value}"",""items"": {jsonArray}}}";
+                    await storageUploadManager.StorageUploadAsync(requestJson);
+                }
+            }
+            else {
+                ////数据存储
+                //string uploadStr = $"{{ \"deviceCode\": \"{_config.WinConfig.DEVICE_CODE}\",\"sampleTime\": \"{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")}\",\"plain\": \"{msg.plain}\"}}\"}}\r\n";
+                // await storageUploadManager.StorageUploadAsync(uploadStr);
             }
         }
         catch (Exception ex)
@@ -510,82 +520,77 @@ private string voltage = "0";
     private readonly object _batchLock = new object();
 
     private async Task GetReceiceAsync()    
-  {
-      List<DataMessage> batch = new List<DataMessage>();
-
-     
+      {
+          List<DataMessage> batch = new List<DataMessage>();
+          
+          
           try
           {
-              await foreach (var item in _recvQueueStr.Reader.ReadAllAsync(_cts.Token))
-              {
-                  if (!portChecker.IsPortOpen)
-                  {
-                      await Task.Delay(1000);
-                      continue;
-                  }
-
-                  try
-                  {
-                      if (_recvQueueStr.Reader.Count == 0)
-                      {
-                          await Task.Delay(100);
-                          continue;
-                      }
-
-
-                      var msg = new DataMessage
-                      {
-                          plain = JsonConvert.SerializeObject(item)
-                      };
-                      var iotData = JsonSerializer.Deserialize<IotDataMessageModelNew>(item);
-                      long timestamp = Convert.ToInt64(iotData.timestamp);
-                   
-                    // 4. 加密（如果需要）
-                    if (_config.Common.EnableEncryption)
-                      {
-                        AddJsonItem(item);
-                        if (currentCount ==1000)
+            while (true)
+            {
+                if (!portChecker.IsPortOpen)
+                {
+                    await Task.Delay(1000);
+                    continue;
+                }
+                await foreach (var item in _recvQueueStr.Reader.ReadAllAsync())
+                {
+                    try
+                    {
+                        if (_recvQueueStr.Reader.Count == 0)
                         {
-                            currentBatch.Append("]");// 结束数组
-                            string jsonArray = currentBatch.ToString();
-                         
+                            await Task.Delay(100);
+                            continue;
+                        }
 
-                            string requestJson = $@"{{ ""timestamp"": {timestamp}, ""deviceMac"":""{macAddress}"", ""items"": {jsonArray}}}";
-                            var keyResult = await GetKey(requestJson);
-                            // 重置计数器和StringBuilder
-                            currentBatch.Clear();
-                            currentCount = 0;
-                            if (keyResult is null)
+
+                        var msg = new DataMessage
+                        {
+                            plain = JsonConvert.SerializeObject(item)
+                        };
+                        var iotData = JsonSerializer.Deserialize<IotDataMessageModelNew>(item);
+                        long timestamp = Convert.ToInt64(iotData.timestamp);
+
+                        // 4. 加密（如果需要）
+                        if (bool.TryParse(_config.EnableEncryption?.value, out bool enableEncryption2) && enableEncryption2)
+                        {
+                            AddJsonItem(item);
+                            if (currentCount == 500)
                             {
-                                return;
+                                currentBatch.Append("]");// 结束数组
+                                string jsonArray = currentBatch.ToString();
+
+
+                                string requestJson = $@"{{ ""timestamp"": {timestamp}, ""deviceMac"":""{macAddress}"",""deviceCode"": ""{_config.DEVICE_CODE?.value}"",""dataCollectDeivceNO"":""{_config.DATA_COLLECT_DEVICE_NO?.value}"", ""items"": {jsonArray}}}";
+
+                                var keyResult = await GetKey(requestJson);
+                                // 重置计数器和StringBuilder
+                                currentBatch.Clear();
+                                currentCount = 0;
+                                if (keyResult is null)
+                                {
+                                    return;
+                                }
                             }
 
-                            var result = new
-                            {
-                                deviceMac=macAddress,
-                                deviceCode = _config.WinConfig.DATA_COLLECT_DEVICE_NO,
-                                dateCollectDeivceNO = _config.WinConfig.DEVICE_CODE,
-                                items = keyResult.items.ToList()
-
-                            };
-                             
-                            await SenBatchdData(JsonConvert.SerializeObject(result), _config.UpMQTT.CommandDataTopic);
                         }
-                         
-                        
+
+
+                        //await Task.Delay(2);
                     }
-                            
-                    //await Task.Delay(2);
+                    catch
+                    {
+                    }
+                    finally
+                    {
+                        batch.Clear();
+
+                    }
                 }
-                  catch
-                  {
-                  }
-                  finally
-                  {
-                      batch.Clear();
-                   
-                }
-              }
+
+                await Task.Delay(1000);
+            }
+              
           }
           catch 
           {
@@ -601,15 +606,7 @@ private string voltage = "0";
    
   }
 
-
-    StringBuilder currentBatchs = new StringBuilder();
-    int currentCounts = 0;
-    const int BATCH_SIZEs = 1000;
-
-    // 全局变量
-    StringBuilder currentBatch = new StringBuilder();
-    int currentCount = 0;
-    const int BATCH_SIZE = 1000;
+    
     void AddJsonItem(string jsonItem)
     {
         if (currentCount == 0)
@@ -657,54 +654,8 @@ private string voltage = "0";
         //    CompleteBatch();
         //}
     }
-    // 将消息加入队列，丢弃最旧的消息以控制内存
-    private void EnqueueMessage(DataMessage msg)
-    {
-        // 如果队列已满，先丢弃一条最旧的消息
-        if (_queueCount >= _maxPendingMessages)
-        {
-            _dataMessageQueue.TryDequeue(out _);
-            Interlocked.Decrement(ref _queueCount);
-        }
-
-        _dataMessageQueue.Enqueue(msg);
-        Interlocked.Increment(ref _queueCount);
-    }
-
-    // 尝试批量取出并上传
-    private async Task TryBatchUploadAsync()
-    {
-        //await _batchUploadSemaphore.WaitAsync();
-        try
-        {
-            // 如果队列长度不足批量大小，跳过
-            if (_queueCount < _batchUploadSize)
-                return;
-
-            var batch = new List<DataMessage>(_batchUploadSize);
-            for (int i = 0; i < _batchUploadSize; i++)
-            {
-                if (_dataMessageQueue.TryDequeue(out var msg))
-                {
-                    batch.Add(msg);
-                    Interlocked.Decrement(ref _queueCount);
-                }
-                else
-                    break;
-            }
-
-            if (batch.Count > 0)
-            {
-                var jsonBatch = JsonConvert.SerializeObject(batch);
-                _= SenBatchdData(jsonBatch, _config.UpMQTT.IOTDataTopic);
-            }
-        }
-        finally
-        {
-            //_batchUploadSemaphore.Release();
-        }
-    }
-
+   
+  
     // 异步写日志（避免阻塞）
     private async Task DataWriteLogAsync(string content)
     {
@@ -743,9 +694,27 @@ private string voltage = "0";
         long timestamp = Convert.ToInt64(arg.Get("TIMESTAMP"));
         List<decimal> decimals = (List<decimal>)arg.Get("DECIMALS");
         Dictionary<string, string> dictionary3 = new Dictionary<string, string>();
-        dictionary3.Add("DISCHARGE",  JsonConvert.SerializeObject(decimals));
-        //SetVoltage
-        //Math.Round(GetFirstElementByHexIndex(decimals, _config.Common.CHANNEL), 2, MidpointRounding.ToEven).ToString()
+        
+        // 判断是否为波形图麻点数据（func_code 为 0x02）
+        string funcCode = arg.Get("FUNC_CODE")?.ToString();
+        if (funcCode == "02")
+        {
+            //var wave = "[0.871,0.726,0.726,0.726,0.653,0.653,0.653,0.653,0.726,0.653,0.726,0.653,0.653,0.726,0.726,0.726,0.726,0.726,0.798,0.653,0.726,0.653,0.726,0.726,0.726,0.726,0.798,0.726,0.726,0.726,0.798,0.726,0.653,0.726,0.726,0.798,0.653,0.798,0.653,0.798,0.798,0.798,0.726,0.726,0.726,0.726,0.798,0.871,0.798,0.653,0.726,0.653,0.798,0.726,0.726,0.653,0.726,0.653,0.798,0.726,0.726,0.726,0.798,0.871,0.726,0.871,0.726,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.798,0.726,0.653,0.726,0.871,0.726,0.798,0.726,0.726,0.726,0.726,0.726,0.726,0.798,0.726,0.653,0.871,0.798,0.653,0.653,0.726,0.653,0.653,0.726,0.726,0.726,0.798,0.798,0.726,0.726,0.798,0.871,0.798,0.798,0.726,0.726,0.653,0.798,0.653,0.653,0.653,0.726,0.653,0.726,0.798,0.726,0.798,0.798,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.726,0.798,0.726,0.653,0.726,0.726,0.726,0.798,0.871,0.798,0.798,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.653,0.653,0.726,0.653,0.726,0.726,0.726,0.653,0.653,0.653,0.653,0.581,0.653,0.653,0.653,0.798,0.581,0.653,0.726,0.653,0.726,0.653,0.653,0.798,0.581,0.653,0.726,0.653,0.726,0.798,0.726,0.653,0.726,0.726,0.726,0.653,0.653,0.726,0.798,0.653,0.726,0.653,0.653,0.581,0.581,0.581,0.653,0.798,0.871,0.798,0.871,0.798,0.726,0.653,0.871,0.726,0.653,0.653,0.798,0.726,0.726,0.726,0.726,0.798,0.798,0.726,0.798,0.798,0.798,0.653,0.653,0.726,0.798,0.653,0.726,0.726,0.798,0.726,0.726,0.726,0.798,0.653,0.798,0.726,0.653,0.653,0.653,0.726,0.726,0.726,0.726,0.653,0.726,0.726,0.726,0.798,0.726,0.726,0.798,0.653,0.726,0.581,0.653,0.581,0.653,0.798,0.653,0.726,0.798,0.798,0.798,0.726,0.871,0.726,0.726,0.798,0.726,0.653,0.653,0.798,0.726,0.726,0.653,0.798,0.798,0.726,0.726,0.726,0.726,0.581,0.581,0.726,0.798,0.726,0.726,0.798,0.726,0.798,0.798,0.798,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.871,0.726,0.798,0.798,0.653,0.798,0.726,0.726,0.798,0.653,0.653,0.726,0.653,0.726,0.581,0.798,0.653,0.798,0.798,0.726,0.871,0.726,0.726,0.581,0.726,0.726,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.581,0.726,0.653,0.726,0.653,0.653,0.653,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.726,0.653,0.653,0.798,0.726,0.726,0.726,0.653,0.726,0.798,0.798,0.726,0.726,0.798,0.726,0.726,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.798,0.726,0.653,0.798,0.726,0.653,0.726,0.653,0.726,0.653,0.726,0.653,0.798,0.798,0.798,0.726,0.798,0.798,0.726,0.726,0.726,0.653,0.726,0.726,0.798,0.726,0.798,0.726,0.798,0.726,0.653,0.726,0.726,0.726,0.798,0.726,0.726,0.653,0.798,0.798,0.726,0.653,0.726,0.726,0.726,0.726,0.726,0.798,0.871,0.726,0.726,0.726,0.798,0.653,0.871,0.653,0.653,0.653,0.653,0.726,0.653,0.726,0.653,0.726,0.726,0.726,0.798,0.798,0.726,0.726,0.726,0.726,0.726,0.653,0.726,0.726,0.798,0.871,0.726,0.798,0.798,0.871,0.653,0.798,0.726,0.653,0.798,0.726,0.726,0.726,0.726,0.798,0.726,0.798,0.798,0.726,0.726,0.726,0.726,0.653,0.726,0.798,0.581,0.653,0.726,0.726,0.726,0.726,0.726,0.798,0.726,0.798,0.798,0.798,0.653,0.653,0.726,0.726,0.798,0.653,0.726,0.653,0.798,0.726,0.798,0.798,0.798,0.653,0.726,0.726,0.726,0.726,0.726,0.653,0.726,0.581,0.653,0.726,0.798,0.726,0.726,0.581,0.653,0.726,0.726,0.726,0.726,0.726,0.798,0.653,0.653,0.653,0.653,0.653,0.581,0.653,0.653,0.653,0.726,0.653,0.653,0.653,0.653,0.653,0.653,0.726,0.653,0.798,0.726,0.726,0.726,0.798,0.726,0.798,0.726,0.653,0.726,0.726,0.726,0.653,0.726,0.653,0.653,0.726,0.726,0.653,0.726,0.653,0.653,0.726,0.726,0.798,0.798,0.798,0.798,0.726,0.726,0.798,0.653,0.798,0.653,0.653,0.798,0.653,0.726,0.726,0.798,0.726,0.871,0.798,0.798,0.653,0.798,0.581,0.653,0.653,0.726,0.726,0.798,0.798,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.581,0.581,0.726,0.653,0.581,0.726,0.798,0.726,0.726,0.798,0.798,0.798,0.726,0.726,0.653,0.653,0.653,0.653,0.726,0.653,0.726,0.726,0.726,0.798,0.726,0.726,0.726,0.726,0.798,0.653,0.726,0.653,0.798,0.798,0.726,0.798,0.726,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.726,0.653,0.653,0.581,0.726,0.653,0.726,0.798,0.798,0.798,0.653,0.726,0.653,0.726,0.726,0.726,0.726,0.653,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.726,0.798,0.726,0.726,0.726,0.871,0.726,0.653,0.726,0.653,0.798,0.726,0.726,0.726,0.653,0.726,0.653,0.798,0.726,0.726,0.581,0.653,0.726,0.726,0.726,0.726,0.653,0.798,0.653,0.726,0.653,0.653,0.726,0.726,0.726,0.653,0.726,0.653,0.653,0.653,0.581,0.653,0.726,0.726,0.726,0.798,0.581,0.653,0.798,0.726]";
+            //dictionary3.Add("WAVEFORM", JsonConvert.SerializeObject(decimals));
+        }
+        else
+        {
+            dictionary3.Add("discharge1", decimals.FirstOrDefault().ToString());
+            dictionary3.Add("dischargeNum1", decimals.ElementAtOrDefault(1).ToString());
+            dictionary3.Add("dischargePhase1", decimals.ElementAtOrDefault(2).ToString());
+            dictionary3.Add("discharge2", decimals.ElementAtOrDefault(3).ToString());
+            dictionary3.Add("dischargeNum2", decimals.ElementAtOrDefault(4).ToString());
+            dictionary3.Add("dischargePhase2", decimals.ElementAtOrDefault(5).ToString());
+            //var wave = TcpCollectorClient.PD_WAVE;
+            var wave = "[0.871,0.726,0.726,0.726,0.653,0.653,0.653,0.653,0.726,0.653,0.726,0.653,0.653,0.726,0.726,0.726,0.726,0.726,0.798,0.653,0.726,0.653,0.726,0.726,0.726,0.726,0.798,0.726,0.726,0.726,0.798,0.726,0.653,0.726,0.726,0.798,0.653,0.798,0.653,0.798,0.798,0.798,0.726,0.726,0.726,0.726,0.798,0.871,0.798,0.653,0.726,0.653,0.798,0.726,0.726,0.653,0.726,0.653,0.798,0.726,0.726,0.726,0.798,0.871,0.726,0.871,0.726,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.798,0.726,0.653,0.726,0.871,0.726,0.798,0.726,0.726,0.726,0.726,0.726,0.726,0.798,0.726,0.653,0.871,0.798,0.653,0.653,0.726,0.653,0.653,0.726,0.726,0.726,0.798,0.798,0.726,0.726,0.798,0.871,0.798,0.798,0.726,0.726,0.653,0.798,0.653,0.653,0.653,0.726,0.653,0.726,0.798,0.726,0.798,0.798,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.726,0.798,0.726,0.653,0.726,0.726,0.726,0.798,0.871,0.798,0.798,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.653,0.653,0.726,0.653,0.726,0.726,0.726,0.653,0.653,0.653,0.653,0.581,0.653,0.653,0.653,0.798,0.581,0.653,0.726,0.653,0.726,0.653,0.653,0.798,0.581,0.653,0.726,0.653,0.726,0.798,0.726,0.653,0.726,0.726,0.726,0.653,0.653,0.726,0.798,0.653,0.726,0.653,0.653,0.581,0.581,0.581,0.653,0.798,0.871,0.798,0.871,0.798,0.726,0.653,0.871,0.726,0.653,0.653,0.798,0.726,0.726,0.726,0.726,0.798,0.798,0.726,0.798,0.798,0.798,0.653,0.653,0.726,0.798,0.653,0.726,0.726,0.798,0.726,0.726,0.726,0.798,0.653,0.798,0.726,0.653,0.653,0.653,0.726,0.726,0.726,0.726,0.653,0.726,0.726,0.726,0.798,0.726,0.726,0.798,0.653,0.726,0.581,0.653,0.581,0.653,0.798,0.653,0.726,0.798,0.798,0.798,0.726,0.871,0.726,0.726,0.798,0.726,0.653,0.653,0.798,0.726,0.726,0.653,0.798,0.798,0.726,0.726,0.726,0.726,0.581,0.581,0.726,0.798,0.726,0.726,0.798,0.726,0.798,0.798,0.798,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.871,0.726,0.798,0.798,0.653,0.798,0.726,0.726,0.798,0.653,0.653,0.726,0.653,0.726,0.581,0.798,0.653,0.798,0.798,0.726,0.871,0.726,0.726,0.581,0.726,0.726,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.581,0.726,0.653,0.726,0.653,0.653,0.653,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.726,0.653,0.653,0.798,0.726,0.726,0.726,0.653,0.726,0.798,0.798,0.726,0.726,0.798,0.726,0.726,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.798,0.726,0.653,0.798,0.726,0.653,0.726,0.653,0.726,0.653,0.726,0.653,0.798,0.798,0.798,0.726,0.798,0.798,0.726,0.726,0.726,0.653,0.726,0.726,0.798,0.726,0.798,0.726,0.798,0.726,0.653,0.726,0.726,0.726,0.798,0.726,0.726,0.653,0.798,0.798,0.726,0.653,0.726,0.726,0.726,0.726,0.726,0.798,0.871,0.726,0.726,0.726,0.798,0.653,0.871,0.653,0.653,0.653,0.653,0.726,0.653,0.726,0.653,0.726,0.726,0.726,0.798,0.798,0.726,0.726,0.726,0.726,0.726,0.653,0.726,0.726,0.798,0.871,0.726,0.798,0.798,0.871,0.653,0.798,0.726,0.653,0.798,0.726,0.726,0.726,0.726,0.798,0.726,0.798,0.798,0.726,0.726,0.726,0.726,0.653,0.726,0.798,0.581,0.653,0.726,0.726,0.726,0.726,0.726,0.798,0.726,0.798,0.798,0.798,0.653,0.653,0.726,0.726,0.798,0.653,0.726,0.653,0.798,0.726,0.798,0.798,0.798,0.653,0.726,0.726,0.726,0.726,0.726,0.653,0.726,0.581,0.653,0.726,0.798,0.726,0.726,0.581,0.653,0.726,0.726,0.726,0.726,0.726,0.798,0.653,0.653,0.653,0.653,0.653,0.581,0.653,0.653,0.653,0.726,0.653,0.653,0.653,0.653,0.653,0.653,0.726,0.653,0.798,0.726,0.726,0.726,0.798,0.726,0.798,0.726,0.653,0.726,0.726,0.726,0.653,0.726,0.653,0.653,0.726,0.726,0.653,0.726,0.653,0.653,0.726,0.726,0.798,0.798,0.798,0.798,0.726,0.726,0.798,0.653,0.798,0.653,0.653,0.798,0.653,0.726,0.726,0.798,0.726,0.871,0.798,0.798,0.653,0.798,0.581,0.653,0.653,0.726,0.726,0.798,0.798,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.581,0.581,0.726,0.653,0.581,0.726,0.798,0.726,0.726,0.798,0.798,0.798,0.726,0.726,0.653,0.653,0.653,0.653,0.726,0.653,0.726,0.726,0.726,0.798,0.726,0.726,0.726,0.726,0.798,0.653,0.726,0.653,0.798,0.798,0.726,0.798,0.726,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.726,0.653,0.653,0.581,0.726,0.653,0.726,0.798,0.798,0.798,0.653,0.726,0.653,0.726,0.726,0.726,0.726,0.653,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.726,0.798,0.726,0.726,0.726,0.871,0.726,0.653,0.726,0.653,0.798,0.726,0.726,0.726,0.653,0.726,0.653,0.798,0.726,0.726,0.581,0.653,0.726,0.726,0.726,0.726,0.653,0.798,0.653,0.726,0.653,0.653,0.726,0.726,0.726,0.653,0.726,0.653,0.653,0.653,0.581,0.653,0.726,0.726,0.726,0.798,0.581,0.653,0.798,0.726]";
+            dictionary3.Add("PD_WAVE", wave);
+        }
+
         dictionary3.Add("VOLTAGE", GetVoltage());
         IotDataMessageModelNew iotDataMessageModel = new IotDataMessageModelNew();
         iotDataMessageModel.timestamp = timestamp;
@@ -754,7 +723,6 @@ private string voltage = "0";
         
         iotDataMessageModel.data = dictionary3;
         return iotDataMessageModel;
-
     }
 
     public List<DataMessage> dataMessages = new List<DataMessage>();
@@ -859,12 +827,13 @@ private string voltage = "0";
         var token = _cts.Token;
 
         // 专用高优先级线程：降低 Task/ThreadPool 调度抖动，提升 1ms 采集稳定性。
-        var thread = new Thread(() =>
+        var thread = new Thread(async () =>
         {
             Thread.Sleep(2000);
             OutputLog("数据采集开始");
             _logServices.Info("数据采集开始");
-           string  commandstr = _iniFileManager.GetValue("NEWDATACOLLECTION", "COMMAND");
+            
+           string  commandstr = _config.TcpCommand == null?_iniFileManager.GetValue("NEWDATACOLLECTION", "COMMAND"):_config.TcpCommand.value;
             byte[] sendData = StringUtil.HexStringToByteArray(commandstr);
             //eaeaeaea01000001c0a8100a010100000006000000064058aeaeaeae
             long freq = Stopwatch.Frequency;
@@ -880,13 +849,16 @@ private string voltage = "0";
             timeBeginPeriod(1);
             try
             {
-                while (!token.IsCancellationRequested && socketClient.IsConnected)
+                while (!token.IsCancellationRequested)
                 {
                     try
                     {
                         WaitUntilStopwatchTicks(nextTick, ticksPerMs, token);
-                        if (token.IsCancellationRequested || !socketClient.IsConnected) break;
-
+                        if (token.IsCancellationRequested || !socketClient.IsConnected)
+                        {
+                            continue;
+                            Thread.Sleep(100);
+                        }
                         
                         socketClient.SendAsync(sendData);
 
@@ -921,9 +893,68 @@ private string voltage = "0";
                     {
                         break;
                     }
+                    catch (SocketException ex)
+                    {
+                        // 处理 Socket 断开
+                    }
+                    catch (Exception ex)
+                    {
+                        
+                        _logServices.Error(ex.ToString());
+                    }
+                }
+            }
+            finally
+            {
+                timeEndPeriod(1);
+            }
+        });
+
+        thread.IsBackground = true;
+        thread.Priority = ThreadPriority.Highest;
+        thread.Start();
+    }
+
+    public void ExecuteWaveform()
+    {
+        var token = _cts.Token;
+
+        // 专用高优先级线程：降低 Task/ThreadPool 调度抖动，提升麻点数据采集稳定性。
+        var thread = new Thread(async () =>
+        {
+            Thread.Sleep(2500);
+            OutputLog("波形图麻点数据采集开始");
+            _logServices.Info("波形图麻点数据采集开始");
+            string commandstr = _config.TcpWaveCommand == null? _iniFileManager.GetValue("NEWDATACOLLECTION", "WAVEFORMCOMMAND"):_config.TcpWaveCommand.value;
+         
+            byte[] sendData = StringUtil.HexStringToByteArray(commandstr);
+            //eaeaeaea01000001c0a8100a020100000006000000064058aeaeaeae
+            var d = new TcpCollectorClient(_config.IP?.value,int.Parse(_config.PORT?.value));
+            d.OnLog += (msg) => _logServices.Warning(msg);
+
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        d.SendRequestAsync(sendData);
+                        await Task.Delay(1000, token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                    catch (SocketException ex)
+                    {
+                        // 处理 Socket 断开
+                    }
                     catch (Exception ex)
                     {
                         _logServices.Error(ex.ToString());
+                    }
+                    finally { 
+                      
                     }
                 }
             }
@@ -939,7 +970,7 @@ private string voltage = "0";
     }
     public async Task SenBatchdData(string message, string topic)
     {
-        await _dataUploader.BatchUploadAsync(message, topic);
+        //await _dataUploader.BatchUploadAsync(message, topic);
     }
 
     public void OutputLog(string message, bool isflag = false)
@@ -965,25 +996,16 @@ private string voltage = "0";
     }
 
 
-    public void Stop()
-    {
-        _isDataCollecting = false;
-        StopFileLogFlushTask();
-        _cts.Cancel();
-        _heartbeatSender = null;
-        _dataUploader = null;
-        socketClient.Stop();
-        _nativeApiServer?.Stop();
-        _logServices.Info("数据采集已停止");
-        OutputLog("数据采集结束");
-    }
-
     public async Task RestartJavaServiceAsync()
     {
         _javaServiceManagers.OnOutputLog -= (msg) => OutputLog(msg);
         await Task.Delay(100); // 确保事件解绑完成
         _javaServiceManagers.OnOutputLog += (msg) => OutputLog(msg);
-        await _javaServiceManagers.RestartJavaServiceAsync(_config.JavaConfig.JavaPath, _config.JavaConfig.JarPath);
+        
+            var javaJar = _iniFileManager.GetValue("NEWDATACOLLECTION", "JarPath");
+            await _javaServiceManagers.RestartJavaServiceAsync("C:\\Program Files\\Common Files\\Oracle\\Java\\javapath", javaJar);
+        
+       
 
 
     }
@@ -1031,14 +1053,10 @@ private string voltage = "0";
 
     public class IotDataMessageModelNew
     {
-       
-
         public long timestamp { get; set; }
 
         public string timestampType { get; set; }
-
-       
-
+        
         public Dictionary<string, string> data { get; set; }
     }
 

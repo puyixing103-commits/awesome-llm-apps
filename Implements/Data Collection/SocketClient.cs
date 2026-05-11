@@ -11,7 +11,6 @@ using System.Text;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
-using System.Xml;
 
 using DataAcquisitionLibrary;
 using DataAcquisitionLibrary.Utils;
@@ -28,7 +27,7 @@ namespace SocketA0Demo
         public byte[] Data { get; }
         public int Length { get; }
         public long ReceiveTimestamp { get; }
-        
+
         public ReceivedData(byte[] data, int length, long receiveTimestamp)
         {
             Data = data;
@@ -44,18 +43,18 @@ namespace SocketA0Demo
 
         public bool IsConnected { get; private set; } = false;
 
+      
 
-
-        private readonly Channel<ReceivedData> _recvQueue = Channel.CreateBounded<ReceivedData>(
-        new BoundedChannelOptions(20000)
-        {
-            FullMode = BoundedChannelFullMode.DropOldest,
-            SingleWriter = false,
-            SingleReader = false
-        });
+       private readonly Channel<ReceivedData> _recvQueue = Channel.CreateBounded<ReceivedData>(
+       new BoundedChannelOptions(100000)
+       {
+           FullMode = BoundedChannelFullMode.DropOldest,
+           SingleWriter = false,
+           SingleReader = false
+       });
         private int _recvQueueCount;
         private int _droppedRecvFrames;
-
+    
         private int _queueCount = 0;
         private CancellationTokenSource _cts;
 
@@ -64,37 +63,36 @@ namespace SocketA0Demo
         public event Func<DataFrame, Task> OnFrameParsed;
 
         private readonly ILogServices _logServices = LogServices.Instance;
-        private readonly SemaphoreSlim _concurrencyLimit = new(5); // 最多同时跑5个
+         private readonly SemaphoreSlim _concurrencyLimit = new(5); // 最多同时跑5个
         private readonly object _sendLock = new object();
 
-
+     
         public SocketClient(CancellationTokenSource cts)
         {
             _cts = cts;
-            _ = taskt();
+            _=test();
         }
 
-        private async Task taskt() 
+
+        public async Task test()
         {
             while (true)
             {
-                DataAcquisitionManager.EnqueueLog($"采集队列数量：{_recvQueueCount}");
-                //_recvQueueCount
-
-                    await Task.Delay(1000);
+                Console.WriteLine($"当前队列长度: {_recvQueueCount}, 丢弃帧数: {_droppedRecvFrames}");
+                _logServices.Debug($"当前队列长度: {_recvQueueCount}, 丢弃帧数: {_droppedRecvFrames}");
+                await Task.Delay(6000);
             }
-            
-        
         }
+      
         public async Task<bool> Start(string ip, int port)
         {
             try
             {
                 _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                await _socket.ConnectAsync(ip, port);
+                 await _socket.ConnectAsync(ip, port);
                 IsConnected = true;
                 DataAcquisitionManager.EnqueueLog($"数据源设备:{ip}:{port}连接成功");
-                _logServices.Info($"数据源设备:{ip}:{port}连接成功");
+             
                 _ = ProcessLoop();
                 _ = ReceiveLoop();
                 return true;
@@ -102,19 +100,17 @@ namespace SocketA0Demo
             catch (Exception exp)
             {
                 IsConnected = false;
-               
                 DataAcquisitionManager.EnqueueLog($"数据源设备:{ip}:{port}失败,Error:{exp.Message}");
-                _logServices.Error($"数据源设备:{ip}:{port}连接失败,Error:{exp.Message}");
                 return false;
             }
-
+            
         }
 
         private async Task ReceiveLoop()
         {
             byte[] buffer = new byte[4096];
             StringBuilder S = new StringBuilder();
-            int recvCount = 0;
+             int recvCount = 0;
             long lastSecond = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             while (!_cts.Token.IsCancellationRequested)
             {
@@ -133,18 +129,18 @@ namespace SocketA0Demo
 
                     byte[] data = ArrayPool<byte>.Shared.Rent(len);
                     Buffer.BlockCopy(buffer, 0, data, 0, len);
-                   // var timestmp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    
+
                     //时间戳
                     var dateNow = DateTime.UtcNow;
                     // 获取纳秒级时间戳（16位）: 毫秒级时间戳(13位) + 纳秒部分(3位)
-                    var timestmp = (new DateTimeOffset(dateNow).ToUnixTimeMilliseconds() * 1000) + (dateNow.Ticks % 10000) / 10; // 数据保留到纳秒级保留16位
-
-                    _recvQueue.Writer.TryWrite(new ReceivedData(data, len, timestmp));
+                    long timestmp = (new DateTimeOffset(dateNow).ToUnixTimeMilliseconds() * 1000) + (dateNow.Ticks % 10000) / 10; // 数据保留到纳秒级保留16位
+                    _recvQueue.Writer.TryWrite (new ReceivedData(data, len, timestmp));
                     Interlocked.Increment(ref _recvQueueCount);
-
+                  
                     recvCount++;
                     long currentSecond = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-
+                   
                     if (currentSecond > lastSecond)
                     {
                         recvCount = 0;
@@ -164,7 +160,6 @@ namespace SocketA0Demo
         {
             try
             {
-                _recvQueueCount = 0;
                 await foreach (var item in _recvQueue.Reader.ReadAllAsync(_cts.Token))
                 {
                     if (!IsConnected)
@@ -176,62 +171,61 @@ namespace SocketA0Demo
                     {
 
                         var receivedData = item;
+                       
+                            Interlocked.Decrement(ref _recvQueueCount);
+                            long processTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                            long delay = processTimestamp - receivedData.ReceiveTimestamp;
 
-                        Interlocked.Decrement(ref _recvQueueCount);
-                        long processTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                        long delay = processTimestamp - receivedData.ReceiveTimestamp;
-
-                        try
-                        {
-                            var frames = _parser.Parse(receivedData.Data, receivedData.Length);
-
-                            foreach (var frameData in frames)
+                            try
                             {
-                                DataFrame df = new DataFrame
+                                var frames = _parser.Parse(receivedData.Data, receivedData.Length);
+
+                                foreach (var frameData in frames)
                                 {
-                                    Payload = frameData,
-                                    DataLength = frameData.Length
-                                };
-                                df.Add("RECEIVE_TIMESTAMP", receivedData.ReceiveTimestamp);
-                                df.Add("PROCESS_TIMESTAMP", processTimestamp);
-                                df.Add("QUEUE_DELAY_MS", delay);
-                                df.Add("TIMESTAMP", receivedData.ReceiveTimestamp);
-                                ParseFrame(frameData, df);
-                                await InvokeCallbackAsync(df);
+                                    DataFrame df = new DataFrame
+                                    {
+                                        Payload = frameData,
+                                        DataLength = frameData.Length
+                                    };
+                                    df.Add("RECEIVE_TIMESTAMP", receivedData.ReceiveTimestamp);
+                                    df.Add("PROCESS_TIMESTAMP", processTimestamp);
+                                    df.Add("QUEUE_DELAY_MS", delay);
+                                    df.Add("TIMESTAMP", receivedData.ReceiveTimestamp);
+                                    ParseFrame(frameData, df);
+                                    await InvokeCallbackAsync(df);
+                                }
                             }
-                        }
 
-                        catch (Exception ex)
-                        {
-                            _logServices.Error(ex.ToString());
-                        }
-                        finally
-                        {
-                            if (receivedData.Data != null)
+                            catch (Exception ex)
                             {
-                                ArrayPool<byte>.Shared.Return(receivedData.Data);
+                                _logServices.Error(ex.ToString());
                             }
-                        }
+                            finally
+                            {
+                                if (receivedData.Data != null)
+                                {
+                                    ArrayPool<byte>.Shared.Return(receivedData.Data);
+                                }
+                            }
                     }
                     catch (Exception ex)
                     {
                         _logServices.Error(ex.ToString());
                     }
-                 // await Task.Delay(1, _cts.Token);
+                  //  await Task.Delay(1,_cts.Token);
                 }
             }
             catch (OperationCanceledException)
             {
                 // 正常停止
             }
-
+           
         }
-
-
+       
 
         async Task InvokeCallbackAsync(DataFrame frame)
         {
-            //  await _concurrencyLimit.WaitAsync();
+          //  await _concurrencyLimit.WaitAsync();
             try { await OnFrameParsed(frame); }
             finally {/* _concurrencyLimit.Release();*/ }
         }
@@ -267,11 +261,11 @@ namespace SocketA0Demo
             }
 
             df.Add("DECIMALS", dictionary["DECIMALS"]);
-
+            
             return df;
         }
 
-
+    
         public Task SendAsync(byte[] data)
         {
             if (!IsConnected)
@@ -289,16 +283,16 @@ namespace SocketA0Demo
             return Task.CompletedTask;
         }
 
-
+      
         public void Stop()
         {
             IsConnected = false;
             _socket?.Close();
         }
-
+      
     }
 
-
+     
 
     public class FrameParser
     {
