@@ -76,7 +76,7 @@ namespace SocketA0Demo
 
         public async Task test()
         {
-            while (true)
+            while (!_cts.Token.IsCancellationRequested)
             {
                 Console.WriteLine($"当前队列长度: {_recvQueueCount}, 丢弃帧数: {_droppedRecvFrames}");
                 _logServices.Debug($"当前队列长度: {_recvQueueCount}, 丢弃帧数: {_droppedRecvFrames}");
