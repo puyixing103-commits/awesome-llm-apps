@@ -1,24 +1,16 @@
 using System;
 using System.Buffers;
-using System.Collections;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
-using System.Runtime.Remoting.Channels;
 using System.Text;
 using System.Threading;
-using System.Threading.Channels;
 using System.Threading.Tasks;
 
 using DataAcquisitionLibrary;
 using DataAcquisitionLibrary.Utils;
 
 using DC_0003.Models;
-
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
 
 namespace SocketA0Demo
 {
@@ -36,198 +28,172 @@ namespace SocketA0Demo
         }
     }
 
+    public sealed class SynchronousSocketRequestClient
+    {
+        private readonly FrameParser _parser = new();
+        private readonly int _receiveTimeoutMs;
+
+        public SynchronousSocketRequestClient(int receiveTimeoutMs = 5000)
+        {
+            _receiveTimeoutMs = receiveTimeoutMs;
+        }
+
+        public List<ReceivedData> SendAndReceive(Socket socket, byte[] request, object syncRoot)
+        {
+            if (socket == null) throw new ArgumentNullException(nameof(socket));
+            if (request == null || request.Length == 0) return new List<ReceivedData>();
+
+            lock (syncRoot)
+            {
+                socket.Send(request);
+                return ReceiveFrames(socket);
+            }
+        }
+
+        private List<ReceivedData> ReceiveFrames(Socket socket)
+        {
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(4096);
+            try
+            {
+                while (true)
+                {
+                    int len = socket.Receive(buffer, 0, buffer.Length, SocketFlags.None);
+                    if (len == 0)
+                    {
+                        throw new SocketException((int)SocketError.ConnectionReset);
+                    }
+
+                    long receiveTimestamp = CreateTimestamp();
+                    var frames = _parser.Parse(buffer, len);
+                    if (frames.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    List<ReceivedData> results = new List<ReceivedData>(frames.Count);
+                    foreach (var frame in frames)
+                    {
+                        results.Add(new ReceivedData(frame, frame.Length, receiveTimestamp));
+                    }
+
+                    return results;
+                }
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
+            {
+                throw new TimeoutException($"同步请求等待响应超时，超时时间 {_receiveTimeoutMs}ms", ex);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+
+        private static long CreateTimestamp()
+        {
+            var dateNow = DateTime.UtcNow;
+            return (new DateTimeOffset(dateNow).ToUnixTimeMilliseconds() * 1000) + (dateNow.Ticks % 10000) / 10;
+        }
+    }
+
     public class SocketClient
     {
-        private const int MaxReceiveQueueSize = 50000;
+        private const int DefaultReceiveTimeoutMs = 5000;
         private Socket _socket;
 
         public bool IsConnected { get; private set; } = false;
 
-      
-
-       private readonly Channel<ReceivedData> _recvQueue = Channel.CreateBounded<ReceivedData>(
-       new BoundedChannelOptions(100000)
-       {
-           FullMode = BoundedChannelFullMode.DropOldest,
-           SingleWriter = false,
-           SingleReader = false
-       });
-        private int _recvQueueCount;
-        private int _droppedRecvFrames;
-    
-        private int _queueCount = 0;
+        private string _ip;
+        private int _port;
+        private Task _reconnectTask;
+        private readonly object _reconnectLock = new object();
+        private bool _isUserStopped = false;
         private CancellationTokenSource _cts;
-
-        private FrameParser _parser = new();
+        private readonly SynchronousSocketRequestClient _requestClient = new(DefaultReceiveTimeoutMs);
 
         public event Func<DataFrame, Task> OnFrameParsed;
 
+        /// <summary>日志输出事件（替代对 DataAcquisitionManager 的静态依赖）</summary>
+        public event Action<string> OnLog;
+
         private readonly ILogServices _logServices = LogServices.Instance;
-         private readonly SemaphoreSlim _concurrencyLimit = new(5); // 最多同时跑5个
         private readonly object _sendLock = new object();
 
-     
+
         public SocketClient(CancellationTokenSource cts)
         {
             _cts = cts;
-            _=test();
         }
 
+        private void Log(string message) => OnLog?.Invoke(message);
 
-        public async Task test()
-        {
-            while (!_cts.Token.IsCancellationRequested)
-            {
-                Console.WriteLine($"当前队列长度: {_recvQueueCount}, 丢弃帧数: {_droppedRecvFrames}");
-                _logServices.Debug($"当前队列长度: {_recvQueueCount}, 丢弃帧数: {_droppedRecvFrames}");
-                await Task.Delay(6000);
-            }
-        }
-      
         public async Task<bool> Start(string ip, int port)
         {
             try
             {
-                _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                 await _socket.ConnectAsync(ip, port);
+                _ip = ip;
+                _port = port;
+                _isUserStopped = false;
+                _socket = CreateSocket();
+                await _socket.ConnectAsync(ip, port);
                 IsConnected = true;
-                DataAcquisitionManager.EnqueueLog($"数据源设备:{ip}:{port}连接成功");
-             
-                _ = ProcessLoop();
-                _ = ReceiveLoop();
+                Log($"数据源设备:{ip}:{port}连接成功");
+
                 return true;
             }
             catch (Exception exp)
             {
                 IsConnected = false;
-                DataAcquisitionManager.EnqueueLog($"数据源设备:{ip}:{port}失败,Error:{exp.Message}");
+                Log($"数据源设备:{ip}:{port}失败,Error:{exp.Message}");
                 return false;
             }
-            
+
         }
 
-        private async Task ReceiveLoop()
+        private static Socket CreateSocket()
         {
-            byte[] buffer = new byte[4096];
-            StringBuilder S = new StringBuilder();
-             int recvCount = 0;
-            long lastSecond = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            while (!_cts.Token.IsCancellationRequested)
-            {
-                try
-                {
-                    if (!IsConnected)
-                    {
-                        await Task.Delay(100, _cts.Token);
-                        continue;
-                    }
-                    int len = await _socket.ReceiveAsync(
-                            new ArraySegment<byte>(buffer),
-                            SocketFlags.None
-                        );
-                    if (len <= 0) continue;
-
-                    byte[] data = ArrayPool<byte>.Shared.Rent(len);
-                    Buffer.BlockCopy(buffer, 0, data, 0, len);
-                    
-
-                    //时间戳
-                    var dateNow = DateTime.UtcNow;
-                    // 获取纳秒级时间戳（16位）: 毫秒级时间戳(13位) + 纳秒部分(3位)
-                    long timestmp = (new DateTimeOffset(dateNow).ToUnixTimeMilliseconds() * 1000) + (dateNow.Ticks % 10000) / 10; // 数据保留到纳秒级保留16位
-                    _recvQueue.Writer.TryWrite (new ReceivedData(data, len, timestmp));
-                    Interlocked.Increment(ref _recvQueueCount);
-                  
-                    recvCount++;
-                    long currentSecond = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                   
-                    if (currentSecond > lastSecond)
-                    {
-                        recvCount = 0;
-                        lastSecond = currentSecond;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logServices.Error(ex.ToString());
-                }
-
-                await Task.Delay(10, _cts.Token);
-            }
+            Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            socket.NoDelay = true;
+            socket.ReceiveTimeout = DefaultReceiveTimeoutMs;
+            socket.SendTimeout = DefaultReceiveTimeoutMs;
+            return socket;
         }
 
-        private async Task ProcessLoop()
+        private async Task HandleReceivedDataAsync(ReceivedData receivedData)
         {
             try
             {
-                await foreach (var item in _recvQueue.Reader.ReadAllAsync(_cts.Token))
+                long processTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                long delay = processTimestamp - receivedData.ReceiveTimestamp;
+
+                DataFrame df = new DataFrame
                 {
-                    if (!IsConnected)
-                    {
-                        await Task.Delay(100, _cts.Token);
-                        continue;
-                    }
-                    try
-                    {
-
-                        var receivedData = item;
-                       
-                            Interlocked.Decrement(ref _recvQueueCount);
-                            long processTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                            long delay = processTimestamp - receivedData.ReceiveTimestamp;
-
-                            try
-                            {
-                                var frames = _parser.Parse(receivedData.Data, receivedData.Length);
-
-                                foreach (var frameData in frames)
-                                {
-                                    DataFrame df = new DataFrame
-                                    {
-                                        Payload = frameData,
-                                        DataLength = frameData.Length
-                                    };
-                                    df.Add("RECEIVE_TIMESTAMP", receivedData.ReceiveTimestamp);
-                                    df.Add("PROCESS_TIMESTAMP", processTimestamp);
-                                    df.Add("QUEUE_DELAY_MS", delay);
-                                    df.Add("TIMESTAMP", receivedData.ReceiveTimestamp);
-                                    ParseFrame(frameData, df);
-                                    await InvokeCallbackAsync(df);
-                                }
-                            }
-
-                            catch (Exception ex)
-                            {
-                                _logServices.Error(ex.ToString());
-                            }
-                            finally
-                            {
-                                if (receivedData.Data != null)
-                                {
-                                    ArrayPool<byte>.Shared.Return(receivedData.Data);
-                                }
-                            }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logServices.Error(ex.ToString());
-                    }
-                  //  await Task.Delay(1,_cts.Token);
-                }
+                    Payload = receivedData.Data,
+                    DataLength = receivedData.Length
+                };
+                df.Add("RECEIVE_TIMESTAMP", receivedData.ReceiveTimestamp);
+                df.Add("PROCESS_TIMESTAMP", processTimestamp);
+                df.Add("QUEUE_DELAY_MS", delay);
+                df.Add("TIMESTAMP", receivedData.ReceiveTimestamp);
+                ParseFrame(receivedData.Data, df);
+                await InvokeCallbackAsync(df);
             }
-            catch (OperationCanceledException)
+            catch (Exception ex)
             {
-                // 正常停止
+                _logServices.Error(ex.ToString());
             }
-           
         }
-       
+
 
         async Task InvokeCallbackAsync(DataFrame frame)
         {
-          //  await _concurrencyLimit.WaitAsync();
-            try { await OnFrameParsed(frame); }
-            finally {/* _concurrencyLimit.Release();*/ }
+            var handler = OnFrameParsed;
+            if (handler == null)
+            {
+                return;
+            }
+
+            await handler(frame);
         }
 
         public DataFrame ParseFrame(byte[] frame, DataFrame existingFrame = null)
@@ -261,11 +227,11 @@ namespace SocketA0Demo
             }
 
             df.Add("DECIMALS", dictionary["DECIMALS"]);
-            
+
             return df;
         }
 
-    
+
         public Task SendAsync(byte[] data)
         {
             if (!IsConnected)
@@ -276,23 +242,90 @@ namespace SocketA0Demo
             {
                 return Task.CompletedTask;
             }
-            lock (_sendLock)
+            try
             {
-                _socket.Send(data);
+                List<ReceivedData> responses = _requestClient.SendAndReceive(_socket, data, _sendLock);
+                foreach (var response in responses)
+                {
+                    // 使用Task.Run避免同步等待异步回调导致的死锁
+                    Task.Run(() => HandleReceivedDataAsync(response)).Wait();
+                }
             }
+            catch (SocketException ex) when (
+                ex.SocketErrorCode == SocketError.ConnectionReset ||
+                ex.SocketErrorCode == SocketError.ConnectionAborted ||
+                ex.SocketErrorCode == SocketError.Shutdown)
+            {
+                IsConnected = false;
+                Log($"数据源设备连接断开: {ex.SocketErrorCode}");
+                TryReconnect();
+                throw;
+            }
+            catch (ObjectDisposedException)
+            {
+                IsConnected = false;
+                TryReconnect();
+                throw;
+            }
+
             return Task.CompletedTask;
         }
 
-      
+
         public void Stop()
         {
+            _isUserStopped = true;
             IsConnected = false;
             _socket?.Close();
         }
-      
+
+        private void TryReconnect()
+        {
+            lock (_reconnectLock)
+            {
+                if (_isUserStopped || _cts.Token.IsCancellationRequested) return;
+                if (_reconnectTask != null && !_reconnectTask.IsCompleted) return;
+
+                _reconnectTask = Task.Run(async () =>
+                {
+                    int delayMs = 3000;
+                    int maxDelayMs = 30000;
+                    while (!_cts.Token.IsCancellationRequested && !_isUserStopped && !IsConnected)
+                    {
+                        try
+                        {
+                            Log($"数据源设备 {_ip}:{_port} 正在重连...");
+                            _socket?.Close();
+                            _socket?.Dispose();
+                            _socket = CreateSocket();
+                            await _socket.ConnectAsync(_ip, _port);
+                            IsConnected = true;
+                            Log($"数据源设备:{_ip}:{_port}重连成功");
+                            return;
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"数据源设备:{_ip}:{_port}重连失败,Error:{ex.Message}");
+                        }
+
+                        try
+                        {
+                            await Task.Delay(delayMs, _cts.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+
+                        delayMs = Math.Min(delayMs * 2, maxDelayMs); // 指数退避，最大30秒
+                    }
+                });
+            }
+        }
+
     }
 
-     
+
 
     public class FrameParser
     {

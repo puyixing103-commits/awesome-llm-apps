@@ -34,3 +34,5 @@ D:\workspace\tuoli\CSharp\DC-0003\DC_0003.Services\bin\Release\System.Text.Encod
 D:\workspace\tuoli\CSharp\DC-0003\DC_0003.Services\bin\Release\System.Text.Json.xml
 D:\workspace\tuoli\CSharp\DC-0003\DC_0003.Services\bin\Release\System.Threading.Channels.xml
 D:\workspace\tuoli\CSharp\DC-0003\DC_0003.Services\bin\Release\System.Threading.Tasks.Extensions.xml
+d:\workspace\tuoli\CSharp\DC-0003\备份\DC_0003.Services\obj\Release\DC_0003.Services.dll
+d:\workspace\tuoli\CSharp\DC-0003\备份\DC_0003.Services\obj\Release\DC_0003.Services.pdb

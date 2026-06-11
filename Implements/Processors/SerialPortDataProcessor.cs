@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -348,9 +348,15 @@ namespace DC_0003.Services.Implements.Processors
             int num = 0;
             Stopwatch stopwatch = Stopwatch.StartNew();
             StringBuilder stringBuilder = new StringBuilder(16);
-            while (true)
+            while (!_cancellationTokenSource.IsCancellationRequested)
             {
-                if ((_reader as SerialPortDataReader).Queue == null || !(_reader as SerialPortDataReader).Queue.TryTake(out var item) || item == null || item.Payload == null)
+                // 添加超时保护，避免无限阻塞
+                if (stopwatch.Elapsed.TotalSeconds > 30)
+                {
+                    _logServices.Warning("GetCollectVol 超时（30秒），退出等待");
+                    break;
+                }
+                if ((_reader as SerialPortDataReader) == null || (_reader as SerialPortDataReader).Queue == null || !(_reader as SerialPortDataReader).Queue.TryTake(out var item, 1000, _cancellationTokenSource.Token) || item == null || item.Payload == null)
                 {
                     continue;
                 }

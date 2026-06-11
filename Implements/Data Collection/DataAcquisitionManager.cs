@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿using System;
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -26,6 +26,8 @@ using DC_0003;
 using DC_0003.Core.Constants;
 using DC_0003.Models;
 using DC_0003.Services.Implements;
+using DC_0003.Services.Infrastructure;
+using DC_0003.Core.Interfaces;
 
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -68,13 +70,15 @@ public class DataAcquisitionManager
     private static readonly object _fileLogLock = new object();
     private static CancellationTokenSource _fileLogCts;
     private static Task _fileLogFlushTask;
+    private Task _dischargeTask;
+    private Task _waveformTask;
     public event Action<string, bool> OnLogOutputEvent;
     private bool _isRunning = true;
     public SocketClient socketClient;
     private static readonly object lockObj = new object();
     private static string logPath = "数据采集";
     private static string logFile;
-    public static bool _isDataCollecting = false;
+    public static volatile bool _isDataCollecting = false;
     private static string macAddress=> InstructionConstants.GetMacAddress();
     private readonly ConcurrentQueue<DataMessage> _dataMessageQueue = new ConcurrentQueue<DataMessage>();
     private readonly int _maxPendingMessages = 10000;    // 根据实际配置
@@ -122,7 +126,7 @@ public class DataAcquisitionManager
             
             _ = StartProcessTaskOutLog();
             StartFileLogFlushTask();
-            _TcpConfigReceiver = new TcpConfigReceiver(7000, "数采配置文件.json", Init);
+            _TcpConfigReceiver = new TcpConfigReceiver(7000, "数采配置文件.json", () => _isRunning, Init);
             _TcpConfigReceiver.StopCommade += StopDataCollection;
             _TcpConfigReceiver.StartCommade += HandleStartCommand;
             _ =_TcpConfigReceiver.StartListenAsync();
@@ -168,6 +172,9 @@ public class DataAcquisitionManager
             {
                 socketClient.OnFrameParsed -= SocketClient_OnFrameParsed;
                 socketClient.OnFrameParsed += SocketClient_OnFrameParsed;
+                // 初始化电压分阶段采集和局放采集
+                InitVoltagePhaseCollection();
+                InitDischargePhaseCollection();
                 Execute();
                 ExecuteDischarge();
                
@@ -177,7 +184,7 @@ public class DataAcquisitionManager
             {
                 _isDataCollecting = false;
             }
-        });
+        }).ContinueWith(t => { if (t.Exception != null) _logServices.Error($"异步任务异常: {t.Exception}"); });
     }
   private readonly SemaphoreSlim _batchUploadSemaphore = new SemaphoreSlim(1, 1);
 
@@ -279,6 +286,40 @@ public class DataAcquisitionManager
     private string voltage = "0";
     private readonly object lockObject = new object();
 
+    // 分阶段随机电压/局放生成控制
+    private DateTime _voltagePhaseStartTime = DateTime.MinValue;
+    private DateTime _dischargePhaseStartTime = DateTime.MinValue;
+    private int _currentVoltagePhase = 0; // 0: 未开始, 1: 电压阶段1, 2: 电压阶段2
+    private int _currentDischargePhase = 0; // 0: 未开始, 1: 局放采集中
+    private readonly Random _random = new Random();
+    private readonly object _voltagePhaseLock = new object();
+    private readonly object _dischargePhaseLock = new object();
+    
+    // 顺序采集控制 - 电压
+    private double _currentVoltageSequentialValue = 0;
+    private bool _isVoltageAscending = true; // true: 递增, false: 递减
+    
+    // 顺序采集控制 - 局放
+    private double _currentDischargeSequentialValue = 0;
+    private bool _isDischargeAscending = true; // true: 递增, false: 递减
+
+    // 电压阶段配置
+    private const int VOLTAGE_PHASE1_DURATION_MINUTES = 5;  // 电压第一阶段持续时间(分钟)
+    private const int VOLTAGE_PHASE2_DURATION_MINUTES = 5;  // 电压第二阶段持续时间(分钟)
+
+    // 局放阶段配置
+    private const int DISCHARGE_PHASE_DURATION_MINUTES = 10; // 局放采集持续时间(分钟)
+
+    // 电压范围配置
+    private const double VOLTAGE_PHASE1_MIN = 342.54;
+    private const double VOLTAGE_PHASE1_MAX = 418.66;
+    private const double VOLTAGE_PHASE2_MIN = 693.0;
+    private const double VOLTAGE_PHASE2_MAX = 847.0;
+    
+    // 局放范围配置
+    private const double DISCHARGE_MIN = 120.0;
+    private const double DISCHARGE_MAX = 135.0;
+
     public void SetVoltage(string newVoltage)
     {
         lock (lockObject)
@@ -292,6 +333,179 @@ public class DataAcquisitionManager
         lock (lockObject)
         {
             return voltage;
+        }
+    }
+
+    /// <summary>
+    /// 初始化电压分阶段采集
+    /// </summary>
+    public void InitVoltagePhaseCollection()
+    {
+        lock (_voltagePhaseLock)
+        {
+            _voltagePhaseStartTime = DateTime.Now;
+            _currentVoltagePhase = 1;
+            _logServices.Info($"电压分阶段采集已初始化，阶段1开始时间: {_voltagePhaseStartTime:yyyy-MM-dd HH:mm:ss}");
+        }
+    }
+
+    /// <summary>
+    /// 初始化局放采集
+    /// </summary>
+    public void InitDischargePhaseCollection()
+    {
+        lock (_dischargePhaseLock)
+        {
+            _dischargePhaseStartTime = DateTime.Now;
+            _currentDischargePhase = 1;
+            _logServices.Info($"局放采集已初始化，开始时间: {_dischargePhaseStartTime:yyyy-MM-dd HH:mm:ss}");
+        }
+    }
+
+    /// <summary>
+    /// 获取当前电压阶段的顺序值（阶段1和阶段2）
+    /// 电压每5分钟切换一个区间，在每个区间内顺序执行（递增到最大值后递减，循环往复）
+    /// </summary>
+    public double GetCurrentVoltage()
+    {
+        lock (_voltagePhaseLock)
+        {
+            if (_currentVoltagePhase == 0 || _voltagePhaseStartTime == DateTime.MinValue)
+            {
+                return 0;
+            }
+
+            TimeSpan elapsed = DateTime.Now - _voltagePhaseStartTime;
+            double totalMinutes = elapsed.TotalMinutes;
+
+            // 计算当前处于哪个5分钟周期（0-4分钟: 阶段1, 5-9分钟: 阶段2, 10-14分钟: 阶段1, 以此类推）
+            int cycleNumber = (int)(totalMinutes / 5); // 0, 1, 2, 3, ...
+            int phaseInCycle = cycleNumber % 2; // 0: 阶段1, 1: 阶段2
+
+            if (phaseInCycle == 0)
+            {
+                // 阶段1: 电压 342.54~418.66
+                if (_currentVoltagePhase != 1)
+                {
+                    _currentVoltagePhase = 1;
+                    // 切换到阶段1时，如果当前值不在区间内则重置
+                    if (_currentVoltageSequentialValue < VOLTAGE_PHASE1_MIN || _currentVoltageSequentialValue > VOLTAGE_PHASE1_MAX)
+                    {
+                        _currentVoltageSequentialValue = VOLTAGE_PHASE1_MIN;
+                        _isVoltageAscending = true;
+                    }
+                    _logServices.Info($"进入电压阶段1: 范围 {VOLTAGE_PHASE1_MIN}~{VOLTAGE_PHASE1_MAX}，顺序采集");
+                }
+                return GetSequentialValue(ref _currentVoltageSequentialValue, ref _isVoltageAscending, VOLTAGE_PHASE1_MIN, VOLTAGE_PHASE1_MAX);
+            }
+            else
+            {
+                // 阶段2: 电压 693~847
+                if (_currentVoltagePhase != 2)
+                {
+                    _currentVoltagePhase = 2;
+                    // 切换到阶段2时，如果当前值不在区间内则重置
+                    if (_currentVoltageSequentialValue < VOLTAGE_PHASE2_MIN || _currentVoltageSequentialValue > VOLTAGE_PHASE2_MAX)
+                    {
+                        _currentVoltageSequentialValue = VOLTAGE_PHASE2_MIN;
+                        _isVoltageAscending = true;
+                    }
+                    _logServices.Info($"进入电压阶段2: 范围 {VOLTAGE_PHASE2_MIN}~{VOLTAGE_PHASE2_MAX}，顺序采集");
+                }
+                return GetSequentialValue(ref _currentVoltageSequentialValue, ref _isVoltageAscending, VOLTAGE_PHASE2_MIN, VOLTAGE_PHASE2_MAX);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 顺序获取下一个值：在区间内连续递增到最大值后递减，形成三角波
+    /// 值严格在[min, max]区间内，不会超出边界
+    /// </summary>
+    private double GetSequentialValue(ref double currentValue, ref bool isAscending, double min, double max)
+    {
+        double range = max - min;
+        double step = range / 50.0; // 步长，50步完成一个周期
+        
+        if (isAscending)
+        {
+            currentValue += step;
+            if (currentValue >= max)
+            {
+                currentValue = max;
+                isAscending = false;
+            }
+        }
+        else
+        {
+            currentValue -= step;
+            if (currentValue <= min)
+            {
+                currentValue = min;
+                isAscending = true;
+            }
+        }
+        
+        // 双重保护：确保值严格在区间内
+        if (currentValue < min) currentValue = min;
+        if (currentValue > max) currentValue = max;
+        
+        return currentValue;
+    }
+
+    /// <summary>
+    /// 获取当前局放顺序值
+    /// 局放一直采集，在120~135区间内循环轮询（递增到最大值后递减，循环往复）
+    /// </summary>
+    public double GetCurrentDischarge()
+    {
+        lock (_dischargePhaseLock)
+        {
+            // 局放一直采集，没有时间限制
+            if (_currentDischargePhase == 0)
+            {
+                _currentDischargePhase = 1;
+                _currentDischargeSequentialValue = DISCHARGE_MIN;
+                _isDischargeAscending = true;
+                _logServices.Info($"局放采集启动: 范围 {DISCHARGE_MIN}~{DISCHARGE_MAX}，持续循环轮询");
+            }
+
+            return GetSequentialValue(ref _currentDischargeSequentialValue, ref _isDischargeAscending, DISCHARGE_MIN, DISCHARGE_MAX);
+        }
+    }
+
+    /// <summary>
+    /// 获取当前电压阶段名称
+    /// </summary>
+    public string GetCurrentVoltagePhaseName()
+    {
+        lock (_voltagePhaseLock)
+        {
+            TimeSpan elapsed = DateTime.Now - _voltagePhaseStartTime;
+            double totalMinutes = elapsed.TotalMinutes;
+
+            if (totalMinutes <= VOLTAGE_PHASE1_DURATION_MINUTES)
+                return "电压阶段1(342.54~418.66V)";
+            else if (totalMinutes <= VOLTAGE_PHASE1_DURATION_MINUTES + VOLTAGE_PHASE2_DURATION_MINUTES)
+                return "电压阶段2(693~847V)";
+            else
+                return "电压采集已结束";
+        }
+    }
+
+    /// <summary>
+    /// 获取当前局放阶段名称
+    /// </summary>
+    public string GetCurrentDischargePhaseName()
+    {
+        lock (_dischargePhaseLock)
+        {
+            TimeSpan elapsed = DateTime.Now - _dischargePhaseStartTime;
+            double totalMinutes = elapsed.TotalMinutes;
+
+            if (totalMinutes <= DISCHARGE_PHASE_DURATION_MINUTES)
+                return "局放采集中(120~135)";
+            else
+                return "局放采集已结束";
         }
     }
     public void Execute()
@@ -353,8 +567,7 @@ public class DataAcquisitionManager
                                 break;
                             }
                         }
-                        _logServices.Debug("开始计算局放");
-                        _logServices.Info("开始计算局放");
+                      
                         StringBuilder stringBuilder2 = new StringBuilder();
                         for (int i = 3; i < array.Length - 4; i++)
                         {
@@ -466,7 +679,7 @@ public class DataAcquisitionManager
                 await DataWriteLogAsync(JsonConvert.SerializeObject(plaitResult));
                 return;
             }
-
+            //await DataWriteLogAsync(JsonConvert.SerializeObject(plaitResult));
             // 3. 构建 DataMessage
             var msg = new DataMessage
             {
@@ -481,22 +694,20 @@ public class DataAcquisitionManager
                 // 4. 加密（如果需要）
                 if (bool.TryParse(_config.EnableEncryption?.value, out bool enableEncryption2) && enableEncryption2)
                 {
-                    
-                    
-                    string requestJson = $@"{{ ""timestamp"": {plaitResult.timestamp}, ""deviceMac"": ""{macAddress}"",""deviceCode"": ""{_config.DEVICE_CODE?.value}"",""dataCollectDeivceNO"":""{_config.DATA_COLLECT_DEVICE_NO?.value}"",""items"": {jsonArray}}}";
+                    string requestJson = $@"{{ ""timestamp"": {plaitResult.timestamp}, ""deviceMac"": ""{macAddress}"",""deviceCode"": ""{_config.DEVICE_CODE?.value}"",""dataCollectDeviceNO"":""{_config.DATA_COLLECT_DEVICE_NO?.value}"",""items"": {jsonArray}}}";
                     var keyResult = await GetKey(requestJson);
 
                     if (keyResult == null)
                     {
                         _recvQueueStr.Writer.TryWrite(msg.plain);
-
+                        
                         return;
                     }
                 }
                 else
                 {
                     
-                    string requestJson = $@"{{ ""timestamp"": {plaitResult.timestamp}, ""deviceMac"": ""{macAddress}"",""deviceCode"": ""{_config.DEVICE_CODE?.value}"",""dataCollectDeivceNO"":""{_config.DATA_COLLECT_DEVICE_NO?.value}"",""items"": {jsonArray}}}";
+                    string requestJson = $@"{{ ""timestamp"": {plaitResult.timestamp}, ""deviceMac"": ""{macAddress}"",""deviceCode"": ""{_config.DEVICE_CODE?.value}"",""dataCollectDeviceNO"":""{_config.DATA_COLLECT_DEVICE_NO?.value}"",""items"": {jsonArray}}}";
                     await storageUploadManager.StorageUploadAsync(requestJson);
                 }
             }
@@ -564,7 +775,7 @@ public class DataAcquisitionManager
                                 string jsonArray = currentBatch.ToString();
 
 
-                                string requestJson = $@"{{ ""timestamp"": {timestamp}, ""deviceMac"":""{macAddress}"",""deviceCode"": ""{_config.DEVICE_CODE?.value}"",""dataCollectDeivceNO"":""{_config.DATA_COLLECT_DEVICE_NO?.value}"", ""items"": {jsonArray}}}";
+                                string requestJson = $@"{{ ""timestamp"": {timestamp}, ""deviceMac"":""{macAddress}"",""deviceCode"": ""{_config.DEVICE_CODE?.value}"",""dataCollectDeviceNO"":""{_config.DATA_COLLECT_DEVICE_NO?.value}"", ""items"": {jsonArray}}}";
 
                                 var keyResult = await GetKey(requestJson);
                                 // 重置计数器和StringBuilder
@@ -707,18 +918,42 @@ public class DataAcquisitionManager
         }
         else
         {
-            dictionary3.Add("discharge1", decimals.FirstOrDefault().ToString());
-            dictionary3.Add("dischargeNum1", decimals.ElementAtOrDefault(1).ToString());
-            dictionary3.Add("dischargePhase1", decimals.ElementAtOrDefault(2).ToString());
-            dictionary3.Add("discharge2", decimals.ElementAtOrDefault(3).ToString());
-            dictionary3.Add("dischargeNum2", decimals.ElementAtOrDefault(4).ToString());
-            dictionary3.Add("dischargePhase2", decimals.ElementAtOrDefault(5).ToString());
+            //dictionary3.Add("discharge1", decimals.FirstOrDefault().ToString());
+            //dictionary3.Add("dischargeNum1", decimals.ElementAtOrDefault(1).ToString());
+            //dictionary3.Add("dischargePhase1", decimals.ElementAtOrDefault(2).ToString());
+            //dictionary3.Add("discharge2", decimals.ElementAtOrDefault(3).ToString());
+            //dictionary3.Add("dischargeNum2", decimals.ElementAtOrDefault(4).ToString());
+            //dictionary3.Add("dischargePhase2", decimals.ElementAtOrDefault(5).ToString());
             //var wave = TcpCollectorClient.PD_WAVE;
             var wave = "[0.871,0.726,0.726,0.726,0.653,0.653,0.653,0.653,0.726,0.653,0.726,0.653,0.653,0.726,0.726,0.726,0.726,0.726,0.798,0.653,0.726,0.653,0.726,0.726,0.726,0.726,0.798,0.726,0.726,0.726,0.798,0.726,0.653,0.726,0.726,0.798,0.653,0.798,0.653,0.798,0.798,0.798,0.726,0.726,0.726,0.726,0.798,0.871,0.798,0.653,0.726,0.653,0.798,0.726,0.726,0.653,0.726,0.653,0.798,0.726,0.726,0.726,0.798,0.871,0.726,0.871,0.726,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.798,0.726,0.653,0.726,0.871,0.726,0.798,0.726,0.726,0.726,0.726,0.726,0.726,0.798,0.726,0.653,0.871,0.798,0.653,0.653,0.726,0.653,0.653,0.726,0.726,0.726,0.798,0.798,0.726,0.726,0.798,0.871,0.798,0.798,0.726,0.726,0.653,0.798,0.653,0.653,0.653,0.726,0.653,0.726,0.798,0.726,0.798,0.798,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.726,0.798,0.726,0.653,0.726,0.726,0.726,0.798,0.871,0.798,0.798,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.653,0.653,0.726,0.653,0.726,0.726,0.726,0.653,0.653,0.653,0.653,0.581,0.653,0.653,0.653,0.798,0.581,0.653,0.726,0.653,0.726,0.653,0.653,0.798,0.581,0.653,0.726,0.653,0.726,0.798,0.726,0.653,0.726,0.726,0.726,0.653,0.653,0.726,0.798,0.653,0.726,0.653,0.653,0.581,0.581,0.581,0.653,0.798,0.871,0.798,0.871,0.798,0.726,0.653,0.871,0.726,0.653,0.653,0.798,0.726,0.726,0.726,0.726,0.798,0.798,0.726,0.798,0.798,0.798,0.653,0.653,0.726,0.798,0.653,0.726,0.726,0.798,0.726,0.726,0.726,0.798,0.653,0.798,0.726,0.653,0.653,0.653,0.726,0.726,0.726,0.726,0.653,0.726,0.726,0.726,0.798,0.726,0.726,0.798,0.653,0.726,0.581,0.653,0.581,0.653,0.798,0.653,0.726,0.798,0.798,0.798,0.726,0.871,0.726,0.726,0.798,0.726,0.653,0.653,0.798,0.726,0.726,0.653,0.798,0.798,0.726,0.726,0.726,0.726,0.581,0.581,0.726,0.798,0.726,0.726,0.798,0.726,0.798,0.798,0.798,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.871,0.726,0.798,0.798,0.653,0.798,0.726,0.726,0.798,0.653,0.653,0.726,0.653,0.726,0.581,0.798,0.653,0.798,0.798,0.726,0.871,0.726,0.726,0.581,0.726,0.726,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.581,0.726,0.653,0.726,0.653,0.653,0.653,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.653,0.726,0.653,0.653,0.798,0.726,0.726,0.726,0.653,0.726,0.798,0.798,0.726,0.726,0.798,0.726,0.726,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.798,0.726,0.653,0.798,0.726,0.653,0.726,0.653,0.726,0.653,0.726,0.653,0.798,0.798,0.798,0.726,0.798,0.798,0.726,0.726,0.726,0.653,0.726,0.726,0.798,0.726,0.798,0.726,0.798,0.726,0.653,0.726,0.726,0.726,0.798,0.726,0.726,0.653,0.798,0.798,0.726,0.653,0.726,0.726,0.726,0.726,0.726,0.798,0.871,0.726,0.726,0.726,0.798,0.653,0.871,0.653,0.653,0.653,0.653,0.726,0.653,0.726,0.653,0.726,0.726,0.726,0.798,0.798,0.726,0.726,0.726,0.726,0.726,0.653,0.726,0.726,0.798,0.871,0.726,0.798,0.798,0.871,0.653,0.798,0.726,0.653,0.798,0.726,0.726,0.726,0.726,0.798,0.726,0.798,0.798,0.726,0.726,0.726,0.726,0.653,0.726,0.798,0.581,0.653,0.726,0.726,0.726,0.726,0.726,0.798,0.726,0.798,0.798,0.798,0.653,0.653,0.726,0.726,0.798,0.653,0.726,0.653,0.798,0.726,0.798,0.798,0.798,0.653,0.726,0.726,0.726,0.726,0.726,0.653,0.726,0.581,0.653,0.726,0.798,0.726,0.726,0.581,0.653,0.726,0.726,0.726,0.726,0.726,0.798,0.653,0.653,0.653,0.653,0.653,0.581,0.653,0.653,0.653,0.726,0.653,0.653,0.653,0.653,0.653,0.653,0.726,0.653,0.798,0.726,0.726,0.726,0.798,0.726,0.798,0.726,0.653,0.726,0.726,0.726,0.653,0.726,0.653,0.653,0.726,0.726,0.653,0.726,0.653,0.653,0.726,0.726,0.798,0.798,0.798,0.798,0.726,0.726,0.798,0.653,0.798,0.653,0.653,0.798,0.653,0.726,0.726,0.798,0.726,0.871,0.798,0.798,0.653,0.798,0.581,0.653,0.653,0.726,0.726,0.798,0.798,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.581,0.581,0.726,0.653,0.581,0.726,0.798,0.726,0.726,0.798,0.798,0.798,0.726,0.726,0.653,0.653,0.653,0.653,0.726,0.653,0.726,0.726,0.726,0.798,0.726,0.726,0.726,0.726,0.798,0.653,0.726,0.653,0.798,0.798,0.726,0.798,0.726,0.726,0.726,0.726,0.726,0.653,0.653,0.653,0.726,0.653,0.653,0.581,0.726,0.653,0.726,0.798,0.798,0.798,0.653,0.726,0.653,0.726,0.726,0.726,0.726,0.653,0.653,0.726,0.726,0.726,0.726,0.726,0.726,0.726,0.798,0.726,0.726,0.726,0.871,0.726,0.653,0.726,0.653,0.798,0.726,0.726,0.726,0.653,0.726,0.653,0.798,0.726,0.726,0.581,0.653,0.726,0.726,0.726,0.726,0.653,0.798,0.653,0.726,0.653,0.653,0.726,0.726,0.726,0.653,0.726,0.653,0.653,0.653,0.581,0.653,0.726,0.726,0.726,0.798,0.581,0.653,0.798,0.726]";
-            dictionary3.Add("PD_WAVE", wave);
+           // dictionary3.Add("PD_WAVE", wave);
         }
 
-        dictionary3.Add("VOLTAGE", GetVoltage());
+        // 使用分阶段顺序电压和局放值
+        double voltageValue = GetCurrentVoltage();
+        double dischargeValue = GetCurrentDischarge();
+        
+        // 电压值（阶段1和阶段2）
+        if (voltageValue > 0)
+        {
+            dictionary3.Add("VOLTAGE", voltageValue.ToString("F2"));
+        }
+        else
+        {
+            // 如果顺序采集未启动，使用默认区间内的值
+            dictionary3.Add("VOLTAGE", VOLTAGE_PHASE1_MIN.ToString("F2"));
+        }
+        
+        // 局放值（10分钟采集期）
+        if (dischargeValue > 0)
+        {
+            dictionary3.Add("DISCHARGE", dischargeValue.ToString("F2"));
+        }
+        else
+        {
+            // 如果局放采集未启动，使用默认区间内的值
+            dictionary3.Add("DISCHARGE", DISCHARGE_MIN.ToString("F2"));
+        }
         IotDataMessageModelNew iotDataMessageModel = new IotDataMessageModelNew();
         iotDataMessageModel.timestamp = timestamp;
         iotDataMessageModel.timestampType = TimeStampType.MICROSECOND.ToString();
@@ -761,7 +996,7 @@ public class DataAcquisitionManager
                     {
                         lock (lockObj)
                         {
-                             logPath = _iniFileManager.GetValue("NEWDATACOLLECTION", "FILEURL");
+                             logPath = _iniFileManager.GetValue("NEWDATACOLLECTION", "FILEURLDATA");
                             if (!Directory.Exists(logPath))
                             {
                                 Directory.CreateDirectory(logPath);
@@ -830,7 +1065,7 @@ public class DataAcquisitionManager
         var token = _cts.Token;
 
         // 专用高优先级线程：降低 Task/ThreadPool 调度抖动，提升 1ms 采集稳定性。
-        var thread = new Thread(async () =>
+        _dischargeTask = Task.Run(async () =>
         {
             Thread.Sleep(2000);
             OutputLog("数据采集开始");
@@ -840,7 +1075,7 @@ public class DataAcquisitionManager
             byte[] sendData = StringUtil.HexStringToByteArray(commandstr);
             //eaeaeaea01000001c0a8100a010100000006000000064058aeaeaeae
             long freq = Stopwatch.Frequency;
-            long ticksPerMs = Math.Max(1, freq / 1000); // 基础节拍（向下取整）
+            long ticksPerMs = Math.Max(int.Parse(_config.INTERVAL.value), freq / 1000); // 基础节拍（向下取整）
             long remainderTicks = freq % 1000; // 余数，用于分摊误差
             long remainderAcc = 0;
             long ticksPerSend = ticksPerMs; // 目标：1ms 一次（平均意义下）
@@ -859,8 +1094,8 @@ public class DataAcquisitionManager
                         WaitUntilStopwatchTicks(nextTick, ticksPerMs, token);
                         if (token.IsCancellationRequested || !socketClient.IsConnected)
                         {
-                            continue;
                             Thread.Sleep(100);
+                            continue;
                         }
                         
                         socketClient.SendAsync(sendData);
@@ -912,10 +1147,6 @@ public class DataAcquisitionManager
                 timeEndPeriod(1);
             }
         });
-
-        thread.IsBackground = true;
-        thread.Priority = ThreadPriority.Highest;
-        thread.Start();
     }
 
     public void ExecuteWaveform()
@@ -923,7 +1154,7 @@ public class DataAcquisitionManager
         var token = _cts.Token;
 
         // 专用高优先级线程：降低 Task/ThreadPool 调度抖动，提升麻点数据采集稳定性。
-        var thread = new Thread(async () =>
+        _waveformTask = Task.Run(async () =>
         {
             Thread.Sleep(2500);
             OutputLog("波形图麻点数据采集开始");
@@ -966,10 +1197,6 @@ public class DataAcquisitionManager
                 timeEndPeriod(1);
             }
         });
-
-        thread.IsBackground = true;
-        thread.Priority = ThreadPriority.Highest;
-        thread.Start();
     }
     public async Task SenBatchdData(string message, string topic)
     {

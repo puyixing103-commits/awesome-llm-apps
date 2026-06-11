@@ -41,7 +41,7 @@ public class PortChecker
         _checkTask = Task.Run(() => CheckPortLoopAsync(_cts.Token), _cts.Token);
         _logServices.Info($"端口检测服务已启动，检测 {_host}:{_port}");
         OnLog?.Invoke($"端口检测服务已启动，检测 {_host}:{_port}");
-        GetReceiceAsync();
+        GetReceiceAsync?.Invoke();
     }
     
     public void Stop()

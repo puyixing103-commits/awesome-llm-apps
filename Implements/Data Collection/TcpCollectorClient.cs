@@ -52,7 +52,7 @@ namespace DC_0003.Services.Implements
         {
             _host = host;
             _port = port;
-            _=ConnectAsync();
+            _=ConnectAsync().ContinueWith(t => { if (t.Exception != null) Log($"连接异常: {t.Exception.InnerException?.Message}"); });
         }
 
         /// <summary>

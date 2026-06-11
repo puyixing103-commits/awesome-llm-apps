@@ -296,7 +296,7 @@ public class NewMqttServices : IDisposable
         _mqttIsConnected = false;
         try
         {
-            DisconnectAsync().GetAwaiter().GetResult();
+            Task.Run(() => DisconnectAsync()).Wait(3000);
         }
         catch { }
         _mqttClient?.Dispose();

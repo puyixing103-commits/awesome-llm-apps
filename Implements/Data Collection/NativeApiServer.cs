@@ -120,7 +120,7 @@ public class NativeApiServer
                                 break;
 
                             default:
-                                result = "{\"code\":404,\"msg\":\"\"HTPP 接收到未知指令\"}";
+                                result = "{\"code\":404,\"msg\":\"HTPP 接收到未知指令\"}";
                                 OnLogOutput?.Invoke($"HTPP 接收到未知指令:{mqttMessage.commandCode}");
                                 break;
                         }

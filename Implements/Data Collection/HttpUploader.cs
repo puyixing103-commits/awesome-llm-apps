@@ -54,18 +54,13 @@ public class HttpUploader : IUploader
     public async Task<bool> UploadAsync(DataMessage message, string topic)
     {
         var json = JsonConvert.SerializeObject(message);
-        var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-        HttpResponseMessage response;
-        if (_method == "POST")
-            response = await _client.PostAsync(_url, content);
-        else if (_method == "PUT")
-            response = await _client.PutAsync(_url, content);
-        else
-            throw new NotSupportedException($"不支持的 HTTP 方法: {_method}");
-
-        return response.IsSuccessStatusCode;
-        //throw new NotImplementedException();
+        using (var content = new StringContent(json, Encoding.UTF8, "application/json"))
+        using (HttpResponseMessage response = _method == "POST"
+            ? await _client.PostAsync(_url, content)
+            : await _client.PutAsync(_url, content))
+        {
+            return response.IsSuccessStatusCode;
+        }
     }
 
 

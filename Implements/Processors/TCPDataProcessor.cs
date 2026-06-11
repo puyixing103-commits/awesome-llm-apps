@@ -229,7 +229,7 @@ namespace DC_0003.Services.Implements.Processors
 
         public void Init(Instruction instruction)
         {
-            if(_mqttServices != null)
+            if(_mqttServices == null)
             {
                 _mqttServices = new MqttServices(_mqttConfig);
                 _mqttServices.Connect()

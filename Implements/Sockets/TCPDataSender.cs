@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -75,14 +75,25 @@ public class TCPDataSender : IDataSender, INotifyLogOutput
             }
             if (IPAddress.TryParse(text, out var _))
             {
-                try
+                int retryCount = 0;
+                const int maxRetries = 3;
+                while (retryCount < maxRetries && !_serverSocket.Connected)
                 {
-                    _serverSocket.Connect(text, result);
-                }
-                catch (Exception)
-                {
-                    InitServerSocket();
-                    await SendAsync(destination, payload);
+                    try
+                    {
+                        _serverSocket.Connect(text, result);
+                    }
+                    catch (Exception ex)
+                    {
+                        retryCount++;
+                        _logServices.Warning($"[Socket] 连接失败(第{retryCount}次): {ex.Message}");
+                        InitServerSocket();
+                        if (retryCount >= maxRetries)
+                        {
+                            _logServices.Error($"[Socket] 连接[{destination}]已达到最大重试次数({maxRetries})，放弃发送");
+                            return;
+                        }
+                    }
                 }
             }
         }

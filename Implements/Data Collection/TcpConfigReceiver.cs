@@ -14,6 +14,7 @@ using ApiModels;
 
 using DataAcquisitionLibrary;
 
+using DC_0003.Core.Interfaces;
 using DC_0003.Models;
 using DC_0003.Services.Implements.Data_Collection.Dto;
 
@@ -23,6 +24,7 @@ public class TcpConfigReceiver
 {
     private readonly int _port;
     private readonly string _storageFile;
+    private readonly Func<bool> _isCollectingProvider;
     public event Action<string> _reloadCallback; // 可选：热加载回调
     private CancellationTokenSource _cts;
     private event Action _closeCallback;
@@ -32,15 +34,16 @@ public class TcpConfigReceiver
 
     public event Action StopCommade;
 
-    public TcpConfigReceiver(int port, string storageFile, Action<string> reloadCallback = null, Action _ctscallback = null)
+    public event Action<string> OnLog;
+
+    public TcpConfigReceiver(int port, string storageFile, Func<bool> isCollectingProvider, Action<string> reloadCallback = null, Action _ctscallback = null)
     {
         _port = port;
         _storageFile = storageFile;
+        _isCollectingProvider = isCollectingProvider ?? throw new ArgumentNullException(nameof(isCollectingProvider));
         _reloadCallback = reloadCallback;
-        _cts = DataAcquisitionManager._cts;
+        _cts = new CancellationTokenSource();
         LoadConfigToDictionary();
-        //_=HeartbeatServiceAsync();
-        //_=InitConfigAsync();作废
     }
     private HttpListener _listener;
     private Thread _serverThread;
@@ -107,6 +110,7 @@ public class TcpConfigReceiver
                 DispatchCommandDto dispatchCommandDto = JsonConvert.DeserializeObject<DispatchCommandDto>(json);
                
                 logServices.Info($"HTPP 接收到消息: {json},请求头:{request.Url.AbsolutePath}");
+                OnLog?.Invoke($"HTTP 接收到消息: {request.Url.AbsolutePath}");
 
                 switch (request.Url.AbsolutePath)
                 {
@@ -115,7 +119,7 @@ public class TcpConfigReceiver
                         {
                             case "STARTING":
                                 LoadConfigToDictionary();
-                                if (DataAcquisitionManager._isDataCollecting)
+                                if (_isCollectingProvider())
                                 {
                                     logServices.Warning("HTTP请求但当前正在采集数据，已拒绝");
                                     var s = ResponseBuilder.AlreadyRunning();
@@ -134,7 +138,7 @@ public class TcpConfigReceiver
                           
                             case "STOPPED"://停止
 
-                                if (!DataAcquisitionManager._isDataCollecting)
+                                if (!_isCollectingProvider())
                                 {
                                     results = JsonConvert.SerializeObject(ResponseBuilder.AlreadyStopped()); break;
                                 }
@@ -174,7 +178,8 @@ public class TcpConfigReceiver
                 response.ContentLength64 = errorBuffer.Length;
                 response.OutputStream.Write(errorBuffer, 0, errorBuffer.Length);
             }
-            catch { }
+            catch {
+            }
         }
         finally
         {
@@ -217,7 +222,7 @@ public class TcpConfigReceiver
         if (!File.Exists(fullData))
         {
             logServices.Warning($"配置文件不存在: {fullData}");
-            DataAcquisitionManager.EnqueueLog($"配置文件不存在: {fullData}");
+            OnLog?.Invoke($"配置文件不存在: {fullData}");
             return $"{{\"code\":404,\"msg\":\"配置文件不存在\",\"data\":{{\"message\":\"{fullData}\"}}}}";
         }
 
@@ -229,9 +234,11 @@ public class TcpConfigReceiver
             // 触发热加载
             _reloadCallback?.Invoke(jsonStr);
             logServices.Info($"TCP配置接收服务成功更新配置，路径:{fullData}");
+            OnLog?.Invoke($"配置已更新，路径:{fullData}");
             StartCommade?.Invoke("");
             //DataAcquisitionManager.EnqueueLog($"TCP配置接收服务成功更新配置，路径:{fullData}");
             logServices.Info($"数据开始采集");
+            OnLog?.Invoke("数据开始采集");
 
             return JsonConvert.SerializeObject(ResponseBuilder.StartSuccess());
         }
@@ -435,20 +442,18 @@ public class TcpConfigReceiver
             _listener = new HttpListener();
             _listener.Prefixes.Add($"http://+:{_port}/");
             _listener.Start();
-            DataAcquisitionManager.EnqueueLog($"HTTP API 服务已启动：http://localhost:{_port}/");
             logServices.Info($"HTTP API 服务已启动：http://localhost:{_port}/");
-            //OnLogOutput?.Invoke($"HTTP API 服务已启动：http://localhost:{_port}/");
+            OnLog?.Invoke($"HTTP API 服务已启动：http://localhost:{_port}/");
             _serverThread = new Thread(ListenLoop);
             _serverThread.IsBackground = true;
             _serverThread.Start();
         }
         catch (Exception e)
         {
-            DataAcquisitionManager.EnqueueLog($"HTTP API 启动失败：{e.Message}");
-            //OnLogOutput?.Invoke($"HTTP API 启动失败：{e.Message}");
+            logServices.Error($"HTTP API 启动失败：{e.Message}");
+            OnLog?.Invoke($"HTTP API 启动失败：{e.Message}");
             throw;
         }
-        //var listener = new TcpListener(IPAddress.Any, _port); // 监听所有网络接口
         //try
         //{
         //    listener.Start();
@@ -504,9 +509,9 @@ public class TcpConfigReceiver
                 int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
                 if (bytesRead == 0) break;
                 string data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                if (DataAcquisitionManager._isDataCollecting)
+                if (_isCollectingProvider())
                 {
-                    DataAcquisitionManager.EnqueueLog($"TCP配置接收服务收到新配置，但当前正在采集数据，已忽略");
+                    logServices.Info($"TCP配置接收服务收到新配置，但当前正在采集数据，已忽略");
                     var bytes = Encoding.UTF8.GetBytes("ERROR: 当前正在采集数据，无法更新配置\n");
                     await stream.WriteAsync(bytes,0,bytes.Length);
                     await stream.FlushAsync();
@@ -563,7 +568,7 @@ public class TcpConfigReceiver
                     }
                 }
 
-                DataAcquisitionManager.EnqueueLog($"TCP配置接收服务收到新配置，路径:{fullData}，结果:{response.Trim()}");
+                logServices.Info($"TCP配置接收服务收到新配置，路径:{fullData}，结果:{response.Trim()}");
             }
 
            

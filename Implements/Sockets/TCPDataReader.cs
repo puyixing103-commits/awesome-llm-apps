@@ -119,7 +119,11 @@ public class TCPDataReader : ISocketDataReader, IDataReader, IDisposable, INotif
             {
                 continue;
             }
-            foreach (string item in (from p in StringUtil.ByteArrayToHexString(array).Split(new string[1] { "AE AE AE AE" }, StringSplitOptions.None)
+            num += num2;
+            // 仅转换实际接收到的数据长度，而非整个8192字节buffer
+            byte[] validData = new byte[num];
+            Buffer.BlockCopy(array, 0, validData, 0, num);
+            foreach (string item in (from p in StringUtil.ByteArrayToHexString(validData).Split(new string[1] { "AE AE AE AE" }, StringSplitOptions.None)
                                      where p.StartsWith("EA EA EA EA")
                                      select (p + "AE AE AE AE").Replace(" ", "")).ToList())
             {
@@ -139,6 +143,8 @@ public class TCPDataReader : ISocketDataReader, IDataReader, IDisposable, INotif
                 dataFrame.DataLength = num2;
                 this.OnDataRead?.Invoke(this, dataFrame);
             }
+            // 解析完成后重置偏移，等待下一批数据
+            num = 0;
         }
     }
 
@@ -174,6 +180,8 @@ public class TCPDataReader : ISocketDataReader, IDataReader, IDisposable, INotif
         {
             return;
         }
+        int retryCount = 0;
+        const int maxRetries = 10;
         do
         {
             try
@@ -198,8 +206,14 @@ public class TCPDataReader : ISocketDataReader, IDataReader, IDisposable, INotif
             }
             catch (SocketException ex)
             {
-                _logServices.Warning($"[Socket] 连接服务[{ip}:{port}]失败：{ex.Message}");
-                OutputLog($"[Socket] 连接服务[{ip}:{port}]失败：{ex.Message}{Environment.NewLine}");
+                retryCount++;
+                _logServices.Warning($"[Socket] 连接服务[{ip}:{port}]失败(第{retryCount}次)：{ex.Message}");
+                OutputLog($"[Socket] 连接服务[{ip}:{port}]失败(第{retryCount}次)：{ex.Message}{Environment.NewLine}");
+            }
+            if (retryCount >= maxRetries)
+            {
+                _logServices.Warning($"[Socket] 连接服务[{ip}:{port}]已达到最大重试次数({maxRetries})，放弃连接");
+                break;
             }
             Thread.Sleep(TimeSpan.FromSeconds(10.0));
         }

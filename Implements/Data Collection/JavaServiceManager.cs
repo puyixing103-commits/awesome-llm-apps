@@ -78,12 +78,12 @@ public class JavaServiceManager
          string javaPath = java; //@"C:\Program Files\Common Files\Oracle\Java\javapath";
          string jarPath = jar;// @"D:\myapp\encryptProject-0.0.1-SNAPSHOT.jar";
 
-         if (!File.Exists(jarPath))
-         {
-            _logServices.Warning($"错误: JAR 文件不存在: {jarPath}");
-             //OutputLog($"错误: JAR 文件不存在: {jarPath}");
-             return;
-         }
+         //if (!File.Exists(jarPath))
+         //{
+         //   _logServices.Warning($"错误: JAR 文件不存在: {jarPath}");
+         //    //OutputLog($"错误: JAR 文件不存在: {jarPath}");
+         //    return;
+         //}
 
          string javaExePath = Path.Combine(javaPath, "java.exe");
          if (!File.Exists(javaExePath))
